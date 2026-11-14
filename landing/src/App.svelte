@@ -26,10 +26,15 @@
       if (!link || link.target || link.hasAttribute('download')) return
       const url = new URL(link.href, window.location.href)
       if (url.origin !== window.location.origin) return
+      const next = routePath(url.pathname)
+      // Only the landing route lives in this app. Other paths on the same
+      // origin, such as the help centre under /openstream-tv/docs/, are real
+      // pages and have to load normally instead of falling into the 404 view.
+      if (next !== '/') return
       if (url.pathname === window.location.pathname) return
       event.preventDefault()
       history.pushState({}, '', url.pathname + url.search + url.hash)
-      path = routePath(url.pathname)
+      path = next
     }
     document.addEventListener('click', onClick)
 
