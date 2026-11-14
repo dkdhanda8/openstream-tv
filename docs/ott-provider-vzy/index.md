@@ -9,6 +9,9 @@ keywords: [VZY, beta, provider, Kaltura, free tier, EPG]
 
 Evidence record for `VZY.zip`, a Dish/Watcho white-label OTT app.
 
+> [!NOTE]
+> This provider is compiled only into prerelease builds such as `v1.6.0-beta.2`. A stable release has no VZY routes or Settings card. See [Install a beta build](../installations-beta/index.md).
+
 ## 1. Artifact identity (observed fact)
 
 - `VZY/base.apk`, SHA-256 `7cd4724cd030bc0566d8732eba4961d1ba7d0170503b615ac5b4c0d1ce80b275`.

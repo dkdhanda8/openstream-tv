@@ -42,6 +42,7 @@ curl -fsSL https://raw.githubusercontent.com/wpfyorg/openstream-tv/main/scripts/
 | :--- | :--- |
 | `OPENSTREAM_ONBOARD=never` | Turns the guided flow off entirely. |
 | `OPENSTREAM_EPG=true` | Turns the programme guide on without the guide question (default answer is off). |
+| `OPENSTREAM_VERSION=1.6.0-beta.2` | Installs that prerelease, which is the only way to get the beta providers. See [Install a beta build](../installations-beta/index.md). |
 
 > [!NOTE]
 > Piping into `sh` is fine because prompts read `/dev/tty`, not the pipe. With no terminal the installer behaves exactly as it does without this option.

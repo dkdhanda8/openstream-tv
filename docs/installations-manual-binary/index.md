@@ -24,6 +24,8 @@ Open the [latest releases](https://github.com/wpfyorg/openstream-tv/releases/lat
 
 OpenWrt users should generally install the [package](../installations-openwrt/index.md) instead. To pin a release, download the same asset and `SHA256SUMS` from `https://github.com/wpfyorg/openstream-tv/releases/download/v<version>/`.
 
+Prerelease assets live under their hyphenated tag, for example `.../releases/download/v1.6.0-beta.2/`. Those builds add the beta providers; `latest` never points at them. See [Install a beta build](../installations-beta/index.md).
+
 > [!NOTE]
 > The examples below use `openstream-full-x86_64-unknown-linux-musl`, the typical 64-bit Intel/AMD Linux asset. Do not use that binary on Windows, macOS, ARM or Android.
 

@@ -21,6 +21,7 @@ OpenStream TV runs as a server on a computer, a router or a container. Pick the 
 | **Docker** | [Install with Docker](../installations-docker/index.md) | published GHCR image |
 | **Docker Compose** | [Compose setup](../installations-docker-compose/index.md) | reusable compose.yaml |
 | **Manual binary** | [Manual release binary](../installations-manual-binary/index.md) | verify and install by hand |
+| **Beta prerelease** | [Install a beta build](../installations-beta/index.md) | adds the beta providers; no Docker image |
 | **Source** | [Build from source](../installations-build-from-source/index.md) | Cargo build, optional OpenWrt packages |
 
 ---
@@ -34,6 +35,8 @@ OpenStream TV runs as a server on a computer, a router or a container. Pick the 
 
 > [!NOTE]
 > Every supplied installer verifies the download against the release's `SHA-256` manifest before installing.
+
+Stable releases contain **JioTV, JioTV+ and Fastway**. **Airtel Xstream, PlayboxTV, Tata Play and VZY** exist only in the hyphenated prereleases such as `v1.6.0-beta.2`, which `latest` never selects. [Install a beta build](../installations-beta/index.md) explains how to pin one.
 
 ---
 

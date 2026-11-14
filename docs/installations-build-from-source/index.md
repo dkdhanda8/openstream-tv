@@ -25,6 +25,8 @@ The binary is `target/release/ost`. For the slim build:
 cargo build --release --no-default-features --features slim
 ```
 
+To build the beta providers (Airtel Xstream, PlayboxTV, Tata Play, VZY), add the `beta` feature: `cargo build --release --features beta`. See [Install a beta build](../installations-beta/index.md) for what that changes.
+
 ---
 
 ## 📦 Step 2: Run or Install It

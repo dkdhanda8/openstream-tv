@@ -1,32 +1,42 @@
 ---
 title: Find and Watch Live TV
-description: Search and filter channels, use the live player, and read its programme guide.
+description: Use the Live TV home, search and filter channels, play a channel and read its programme guide.
 category: Using OpenStream TV
 keywords: [live TV, channels, filters, player, programme guide, EPG]
 ---
 
 # Find and Watch Live TV
 
+## Start on Live TV
+
+After sign-in, **Live TV** is the home page. It has a large card for the last channel you watched (or the first playable one), with **Watch live**, an **On now** row and a few category rows. **Full guide** opens the guide, and **All channels** opens the full grid. The channel rail on the right lists other channels and links to the playlist and EPG locations in Settings.
+
 ## Find a channel
 
-1. Select **Channels** in the top navigation.
-2. Type part of a channel name in **Search channels**, or choose a **Category** or **Language**.
-3. Turn on **HD** to show HD channels, or **Show unavailable** to include channels not playable for the current account.
+1. Select **Channels** in the sidebar (or the bottom tab bar on a phone).
+2. Type part of a channel name in **Search channels**, or choose a value under **All categories** or **All languages**.
+3. Turn on **HD** to show HD channels only, or **Show unavailable** to include channels the current account cannot play.
 4. Select a channel tile. The list follows the provider marked **Active** in Settings.
 
-Your filters are saved in this browser. **Expected result:** the channel opens in the live player. A dimmed tile or subscription label means the current account may not be able to play it.
+Your filters are saved in this browser. **Expected result:** the channel opens in the live player. A dimmed tile or a **Subscription may be required** ribbon means the current account may not be able to play it.
+
+A channel whose tile is hidden by the default availability filter can still be inspected with **Show unavailable**; if nothing in the catalogue is playable, the page says so and keeps the list visible.
 
 ## Use the player and guide
 
-The player offers pause/resume, mute, playback quality (**Auto**, **High**, **Medium**, **Low**), picture-in-picture when your browser supports it, stream restart and fullscreen. The selected quality is remembered in this browser. The player also shows the current programme when guide data is available, followed by upcoming programme details below the video.
+The player offers pause/resume, mute, playback quality (**Auto**, **High**, **Medium**, **Low**), picture in picture when the browser supports it, **Restart stream** and fullscreen. Quality and the more-options menu are under the player; the chosen quality is remembered in this browser. The **Program guide** panel beside the video shows the current programme and the live schedule when the provider supplies one.
 
-![OpenStream TV live player with quality controls and the current programme guide](../images/player-guide-jiotv-plus.png)
+![OpenStream TV live player with quality controls, the current programme and more channels](../images/player-guide-vzy-playing.png)
 
-This v1.5.0 capture uses a JioTV+ channel and verifies the current player/guide layout. Playback for the tested JioTV+ channel was later verified manually. That single successful test does not establish that every channel will play for every account.
+This v1.6.0 capture uses the VZY free tier on a beta build, and its video was playing when captured. It documents the player and guide layout; one playing channel does not establish that every channel will play for every account.
 
 **Expected result:** playback starts and programme details appear when the channel provides guide data. Quality choices are requests; the available stream may limit the result.
 
-Protected playback may need HTTPS, a supported browser and working Widevine support. Account rights and provider availability also affect playback. See [Requirements](../getting-started-requirements/index.md) and [Network access and HTTPS](../configuration-network-security/index.md).
+If the player cannot start the stream it shows **Playback unavailable** with **Try again** and **All channels** actions. Protected playback may need HTTPS, a supported browser and working Widevine support. Account rights and provider availability also affect playback. See [Requirements](../getting-started-requirements/index.md) and [Network access and HTTPS](../configuration-network-security/index.md).
+
+## Read the full guide
+
+**Guide** in the sidebar lists every playable channel with its current programme, start time, progress and a play control. It is the quickest way to compare channels before opening one; see [Read the Programme Guide](../using-programme-guide/index.md).
 
 ## Catch-up availability
 

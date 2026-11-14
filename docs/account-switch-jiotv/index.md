@@ -23,7 +23,7 @@ The server uses **one active JioTV provider account at a time**, and the web int
 
 The screenshot below shows the JioTV sign-in form while JioTV+ stays connected separately; it shows where the replacement account goes, not a completed switch.
 
-![Settings with the JioTV sign-in card available while JioTV+ remains connected](../images/settings-jiotv-plus.png)
+![Settings with the JioTV sign-in card available while other provider cards keep their own state](../images/settings-providers.png)
 
 ---
 

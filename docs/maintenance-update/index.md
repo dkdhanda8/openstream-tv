@@ -13,11 +13,13 @@ Before updating, note how OpenStream TV was installed and make a private [backup
 
 1. Check the version shown in **Settings** or `ost --help` for available commands.
 2. Stop the running foreground process or service. Record how it was started so you can use the same settings later.
-3. Run `ost update` to fetch a matching release and verify its checksum. To choose a version, use `ost update --version v1.5.0` (replace with the release you intend to install).
+3. Run `ost update` to fetch a matching release and verify its checksum. To choose a version, use `ost update --version v1.6.0` (replace with the release you intend to install).
 4. Restart OpenStream TV using your original command or service manager. On a systemd service, run `sudo systemctl restart openstream` (or `systemctl --user restart openstream` for a user service).
 5. Open the app and check the version and whether Channels and Settings load.
 
 **Expected result:** the new version runs with the existing configuration and account state. The updater needs access to its release source; private releases may require `OPENSTREAM_UPDATE_TOKEN` configured privately.
+
+`ost update` without a version resolves the latest **stable** release, so it moves a beta build back to stable and removes the beta providers. To install or stay on a prerelease, pass its tag: `ost update --version v1.6.0-beta.2`. See [Install a beta build](../installations-beta/index.md).
 
 ## Docker
 

@@ -110,11 +110,11 @@ JioTV+ channels are absent, the UI says JioTV+ is not enabled or connected, OTP 
 
 ### Diagnosis
 
-In **Settings**, check whether JioTV+ is enabled and connected. If the page offers **Unlock** or **Lock**, note that this UI gate can override the configured default. Then check whether the channel is marked as JioTV+ and whether the message names a plan/entitlement problem. An enabled switch does not itself grant a subscription.
+In **Settings**, check whether the JioTV+ card exists and whether it is connected. A missing card means the source is disabled and no unlock override is saved. Then check whether the channel is marked as JioTV+ and whether the message names a plan/entitlement problem. An enabled source does not itself grant a subscription.
 
 ### Solution
 
-Enable JioTV+ in the supported configuration or unlock it in Settings. If JioTV+ is already connected but another provider is active, select **Use JioTV+** in Settings to activate it. Complete the JioTV+ OTP flow only when JioTV+ is disconnected; choose the intended connection when prompted. If the UI says the account lacks a plan, check the subscription with the provider; do not try to bypass the entitlement.
+Enable JioTV+ in the supported configuration, or type an unlock code issued for this server into the **Channels** search box, which turns the source on and reveals its Settings card. If JioTV+ is already connected but another provider is active, select **Use JioTV+** in Settings to activate it. Complete the JioTV+ OTP flow only when JioTV+ is disconnected; choose the intended connection when prompted. If the UI says the account lacks a plan, check the subscription with the provider; do not try to bypass the entitlement.
 
 ### Verification
 

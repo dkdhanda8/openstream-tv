@@ -1,23 +1,43 @@
 ---
 title: Read the Programme Guide
-description: See the current and next TV programmes and understand when catch-up is unavailable.
+description: Use the Guide page, read the schedule beside the player, and understand when catch-up is unavailable.
 category: Using OpenStream TV
 keywords: [programme guide, program guide, EPG, schedule, now playing, upcoming, catch-up]
 ---
 
 # Read the Programme Guide
 
-OpenStream TV shows programme information for a channel when the active provider returns a schedule. You can check what is on now and what comes next without leaving the live player.
+OpenStream TV shows programme information for a channel when the active provider returns a schedule. There are two places to read it: the dedicated **Guide** page and the **Program guide** panel in the live player.
 
-![Programme guide beside the live player for a JioTV+ channel](../images/player-guide-jiotv-plus.png)
+![OpenStream TV Guide page listing channels with a programme title, its time range and progress](../images/programme-guide-vzy.png)
 
-1. Open **Channels** and select an available channel.
-2. Find the **Program guide** section beside or below the player, depending on your screen size.
-3. Look for the current programme marked as playing now. Future programmes appear in order, with a scheduled start time.
-4. Move your pointer over the video or tap the player to show its controls and current programme details. The overlay hides after inactivity; move or tap again to bring it back.
-5. If the guide is empty or says **No guide for this channel**, try another channel. The programme guide depends on provider data.
+## Use the Guide page
 
-**Expected result:** You see the current show title and a list of upcoming programmes when schedule data is available. A new-programme notification appears briefly when the live schedule advances.
+1. Select **Guide** in the sidebar (or the bottom tab bar on a phone).
+2. Read one row per playable channel: channel logo and name, the current programme, its start and end time, and a progress bar.
+3. Where the catalogue has more than one language, use the language chips at the top to narrow the list. Leaving them all unselected shows every channel.
+4. Select a row, or its play arrow, to open that channel in the live player.
+
+Long catalogues load in pages of 24 rows as you scroll, and each visible row requests its own schedule, so the page stays responsive with a few hundred channels.
+
+**Expected result:** each row shows tonight's programme when the provider publishes one. A channel that has no schedule still appears; its row simply has no programme text.
+
+## Read the guide beside the player
+
+1. Open a channel from **Live TV**, **Channels** or **Guide**.
+2. Find the **Program guide** panel to the right of the video on a wide screen, or below it on a phone. It is labelled **Live schedule**.
+3. The current programme is marked **NOW** and followed by the upcoming programmes in start-time order.
+4. Hover or tap the video to show its controls and overlays; they hide after inactivity.
+
+If the panel says **No guide for this channel** or **No schedule available**, the provider returned no usable programme data. The channel can still play. Change channel to compare.
+
+## Why a guide can be empty
+
+- The provider publishes no schedule for that channel, or publishes it without usable start and end times. PlayboxTV and Tata Play are documented as catalogue-only for this reason.
+- The account is disconnected, so no catalogue or schedule is available.
+- The XMLTV file for external players is a separate setting: `epg = false` leaves `/epg.xml.gz` unavailable even when the in-app guide works.
+
+For the XMLTV file, see [Configure EPG](../configuration-iptv-epg-streaming/index.md) and [Fix Missing or Stale Programme Guide](../fix-epg-not-updating/index.md).
 
 ## Can I watch a past programme?
 
@@ -25,4 +45,4 @@ The current Svelte interface does **not** offer a catch-up browser or a button t
 
 ## Guide in a separate IPTV player
 
-Enable EPG on the OpenStream TV server, then copy the **EPG** URL from **Settings** to your IPTV app. See [Set up IPTV/XMLTV](../using-iptv-playlists/index.md) and [Configure EPG](../configuration-iptv-epg-streaming/index.md). For incorrect times or missing shows, see [Fix guide and playlist problems](../troubleshooting-epg-and-playlists/index.md).
+Enable EPG on the OpenStream TV server, then copy the **EPG** URL from **Settings → IPTV playlist & EPG** to your IPTV app. See [Set up IPTV/XMLTV](../using-iptv-playlists/index.md). For incorrect times or missing shows, see [Fix guide and playlist problems](../troubleshooting-epg-and-playlists/index.md).

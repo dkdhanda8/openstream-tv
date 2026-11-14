@@ -1,36 +1,41 @@
 ---
 title: Settings and Account Controls
-description: Check account status, manage passwords and playlist access, and find server configuration guidance.
+description: Check provider status, manage the IPTV links, change the admin password and sign out.
 category: Using OpenStream TV
-keywords: [settings, admin password, playlist, EPG, access key, accounts]
+keywords: [settings, admin password, playlist, EPG, access key, accounts, sign out]
 ---
 
 # Settings and Account Controls
 
-Open **Settings** from the top navigation. The page shows IPTV URLs, account connections and the admin password form.
+Open **Settings** in the sidebar (or the bottom tab bar on a phone). The page has three groups: **Provider login**, **IPTV playlist & EPG**, and **Security**.
 
-![Settings showing local playlist and EPG fields, a disconnected JioTV card and connected JioTV+](../images/settings-jiotv-plus.png)
+![Settings showing the provider login cards, with VZY marked Beta and Active](../images/settings-providers.png)
 
-This disposable v1.5.0 example has JioTV+ connected and JioTV disconnected. The displayed URLs point only to the local test server; your account status and private URLs will differ.
+This v1.6.0 beta capture has VZY connected and active, with JioTV and Fastway available but disconnected. The URL fields are further down the page and are not part of this crop; your account status and private URLs will differ.
 
-## Accounts
+## Provider login
 
-The enabled provider cards show whether each account is logged in or connected and whether it is the **Active** provider. JioTV, JioTV+ and Fastway are **Stable**; PlayboxTV, VZY, Airtel Xstream and Tata Play are **Beta**. Only one provider can be active at a time: signing in makes that provider active, and connected cards offer a **Use …** control to switch. See [JioTV account sign-in](../account-connect-jiotv/index.md), [JioTV+ channels](../account-extras/index.md), [Fastway Live TV](../account-fastway/index.md), [PlayboxTV](../ott-provider-playbox/index.md), [VZY](../ott-provider-vzy/index.md), [Airtel Xstream](../ott-provider-airtel/index.md) and [Tata Play Smart](../ott-provider-tataplay/index.md).
+Each enabled provider appears as a card with a **Stable** or **Beta** pill, and the active one also shows **Active**.
 
-You can [switch JioTV accounts](../account-switch-jiotv/index.md) by logging out and signing in with another number; an administrator can hide provider logout controls with a server configuration option.
+- A disconnected provider shows its sign-in form: a mobile number and **Send OTP** for JioTV, JioTV+, PlayboxTV, Airtel Xstream and Tata Play, or username and password for Fastway. VZY has no account and reports **Free tier available**.
+- A connected provider shows **Logged in** (JioTV) or **Connected**, a **Use …** button when another provider is active, and **Log out** or **Disconnect** unless an administrator set `disable_logout`.
+- Only one provider can be active. Signing in makes that provider active; connected cards offer **Use …** to switch.
 
-## Playlist and guide links
+See [JioTV account sign-in](../account-connect-jiotv/index.md), [JioTV+ channels](../account-extras/index.md), [Fastway Live TV](../account-fastway/index.md), [PlayboxTV](../ott-provider-playbox/index.md), [VZY](../ott-provider-vzy/index.md), [Airtel Xstream](../ott-provider-airtel/index.md) and [Tata Play Smart](../ott-provider-tataplay/index.md). Beta cards exist only in a [beta build](../installations-beta/index.md).
 
-Copy the **Playlist** URL into a compatible IPTV app. Copy **EPG** for the programme guide when EPG is enabled. On a protected server these URLs contain the `/k/<key>/` access-key path even if the input field is visually clipped. **Make a new key** invalidates old key-scoped playlist and stream links, so update every IPTV app afterward. When authentication is deliberately disabled, Settings uses unkeyed `/playlist.m3u` and `/epg.xml.gz` paths and key rotation is unavailable. See [IPTV playlists and XMLTV](../using-iptv-playlists/index.md).
+## IPTV playlist & EPG
 
-## Change the admin password
+The **Playlist and guide links** card holds **Playlist** and **EPG** fields with **Copy** buttons. On a protected server these URLs contain the `/k/<key>/` access-key path. **Make a new key** invalidates old key-scoped playlist and stream links, so update every IPTV app afterwards.
 
-1. Enter the current password.
-2. Enter a new password of at least eight characters.
-3. Select **Change password**.
+The card notes that the EPG file is off when the server has not enabled it (`option epg`). When authentication is deliberately disabled, Settings shows unkeyed `/playlist.m3u` and `/epg.xml.gz` paths and key rotation is unavailable. See [IPTV playlists and XMLTV](../using-iptv-playlists/index.md).
 
-**Expected result:** Settings confirms the change. Other browser sessions are signed out; the current browser stays signed in. See [Admin Sessions and Sign Out](../account-sessions/index.md).
+## Security
+
+- **This browser** ends the admin session on this device; connected providers keep their saved sign-in. This is the only sign-out control on a phone, where the sidebar is hidden.
+- **Admin password** takes the current password and a new one of at least eight characters, then **Change password**.
+
+**Expected result:** Settings confirms the password change. Other browser sessions are signed out; the current browser stays signed in. See [Admin Sessions and Sign Out](../account-sessions/index.md).
 
 ## Server options
 
-The web page does not expose every server setting. EPG generation, JioTV+, Fastway, PlayboxTV, VZY, Airtel Xstream and Tata Play availability, logout behavior, network binding and other runtime options are configured on the server. See [Configuration Reference](../configuration-reference/index.md), [CLI Commands](../configuration-cli/index.md), and [Network access and HTTPS](../configuration-network-security/index.md).
+The web page does not expose every server setting. EPG generation, provider availability, logout behavior, network binding and other runtime options are configured on the server. See [Configuration Reference](../configuration-reference/index.md), [CLI Commands](../configuration-cli/index.md), and [Network access and HTTPS](../configuration-network-security/index.md).

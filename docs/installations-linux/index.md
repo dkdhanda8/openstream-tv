@@ -21,7 +21,7 @@ The default variant is `full`. To choose a variant or pin a version, download th
 
 ```sh
 curl -fsSLO https://raw.githubusercontent.com/wpfyorg/openstream-tv/main/scripts/install.sh
-OPENSTREAM_VARIANT=slim OPENSTREAM_VERSION=1.5.0 sh install.sh
+OPENSTREAM_VARIANT=slim OPENSTREAM_VERSION=1.6.0 sh install.sh
 ```
 
 | Where it lands | When |
@@ -31,6 +31,8 @@ OPENSTREAM_VARIANT=slim OPENSTREAM_VERSION=1.5.0 sh install.sh
 | `OPENSTREAM_INSTALL_DIR` | Set it to choose another directory |
 
 If `ost` is not found afterwards, add the install directory to `PATH` and open a new terminal.
+
+`latest` and every stable version install JioTV, JioTV+ and Fastway only. The beta providers (Airtel Xstream, PlayboxTV, Tata Play, VZY) are published as prereleases; [Install a beta build](../installations-beta/index.md) pins one.
 
 ---
 

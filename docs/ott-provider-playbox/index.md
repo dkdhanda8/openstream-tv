@@ -12,6 +12,9 @@ redacted. The first inventory had no JADX; section 3a records the contracts
 recovered in the follow-up decompilation. Runtime confirmation is still
 required for the items listed under "still unresolved".
 
+> [!NOTE]
+> This provider is compiled only into prerelease builds such as `v1.6.0-beta.2`. A stable release has no PlayboxTV routes, Settings card or `ost playbox login` command. See [Install a beta build](../installations-beta/index.md).
+
 ## 1. Artifact identity (observed fact)
 
 - File: `reverse-engineering/apps/playboxtv.tv.android.in_5.20.1-128_1arch_1dpi_24lang_….apkm`

@@ -11,6 +11,9 @@ Evidence record for `Airtel Xstream Play.apk`. The provider is off by default an
 needs an Airtel mobile number, because the catalogue, EPG and playback calls only
 return data for a signed-in account.
 
+> [!NOTE]
+> This provider is compiled only into prerelease builds such as `v1.6.0-beta.2`. A stable release has no Airtel routes, Settings card or `ost airtel login` command. See [Install a beta build](../installations-beta/index.md).
+
 ## 1. Artifact identity (observed fact)
 
 - `Airtel Xstream Play.apk`, SHA-256

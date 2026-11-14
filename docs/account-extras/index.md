@@ -9,7 +9,7 @@ keywords: [JioTV+, account, OTP, JioTV+ channels, TV+]
 
 **JioTV+** is an optional second source. It needs its own registered mobile number and an eligible JioFiber or AirFiber plan. The **JioTV+** card appears in Settings when the server enables `tv_plus`, and also after a successful unlock: an unlock saves an override that switches the source on even when `tv_plus` is false, and that override survives restarts. Changing `tv_plus` alone may therefore not hide the card.
 
-![Settings showing JioTV+ connected on OpenStream TV v1.5.0](../images/settings-jiotv-plus.png)
+![Settings showing the provider login cards where the JioTV+ card appears once it is enabled](../images/settings-providers.png)
 
 ---
 
@@ -19,7 +19,7 @@ keywords: [JioTV+, account, OTP, JioTV+ channels, TV+]
 2. Enter the registered 10-digit mobile number and select **Continue**.
 3. If asked, choose the matching connection from the list, then select **Send OTP**.
 4. Enter the OTP and select **Connect**.
-5. Check that the card says **Connected**. Connecting JioTV+ makes it the active provider, and the header indicator appears while it is active.
+5. Check that the card says **Connected**. Connecting JioTV+ makes it the active provider, and the provider pill in the top bar and the dot beside the wordmark then show JioTV+ while it is active.
 6. **Channels** now shows the JioTV+ catalogue. To switch back, use **Use JioTV** on another connected card — only one provider can be active at a time.
 
 **Expected result:** channels supplied by the connected source appear when available. A channel can still require a plan or be unavailable for playback.

@@ -29,6 +29,7 @@ Browse in order, or choose the task you need. The categories and article metadat
   - [Install with Docker](installations-docker/index.md)
   - [Install with Docker Compose](installations-docker-compose/index.md)
   - [Install Manually from a Release Binary](installations-manual-binary/index.md)
+  - [Install a Beta (Prerelease) Build](installations-beta/index.md)
   - [Build OpenStream TV from Source](installations-build-from-source/index.md)
 
 ## Account Setup

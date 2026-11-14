@@ -16,7 +16,7 @@ By default OpenStream TV listens on `localhost:5001` so only the server can conn
 3. On another device on the same LAN, visit `http://192.168.1.20:5001/` with **your own server address**.
 4. Sign in with your admin password. Ensure any local firewall permits only the devices you intend.
 
-When the listener is bound to an IPv4 wildcard such as `0.0.0.0`, v1.5.0 also prints a **LAN playlist** URL for each detected private IPv4 address. The option `--public` sets the bind host to `[::]`, which is broader than “allow my TV” and can behave differently across operating systems. Avoid router port-forwarding for this service.
+When the listener is bound to an IPv4 wildcard such as `0.0.0.0`, the server also prints a **LAN playlist** URL for each detected private IPv4 address. The option `--public` sets the bind host to `[::]`, which is broader than “allow my TV” and can behave differently across operating systems. Avoid router port-forwarding for this service.
 
 ## HTTPS and protected browser playback
 
@@ -47,6 +47,6 @@ Run `ost tunnel setup --domain example.com --subdomain tv --port 5001` with a sc
 
 The access key protects the key-scoped playlist and stream routes such as `/k/<key>/...`; it is not a blanket password for every HTTP path. Browser administration uses its own session/password checks, and the server also has intentionally public bootstrap/static/auth endpoints. Do not describe the access key as protecting the entire server.
 
-Fastway has an additional upstream transport limitation in v1.5.0: its provider API and configured PallyCon license endpoint are plain `http://` URLs. Enabling HTTPS on your local OpenStream TV listener does not encrypt those upstream Fastway hops. See [Fastway account setup](../account-fastway/index.md) and [Fastway troubleshooting](../troubleshooting-fastway/index.md).
+Fastway has an additional upstream transport limitation: its provider API and configured PallyCon license endpoint are plain `http://` URLs. Enabling HTTPS on your local OpenStream TV listener does not encrypt those upstream Fastway hops. See [Fastway account setup](../account-fastway/index.md) and [Fastway troubleshooting](../troubleshooting-fastway/index.md).
 
 For config values, see [Configuration Reference](../configuration-reference/index.md); for lost access, see [troubleshooting](../troubleshooting/index.md).

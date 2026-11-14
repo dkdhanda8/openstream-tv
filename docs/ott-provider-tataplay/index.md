@@ -11,6 +11,9 @@ This record covers two app generations: the older `com.ryzmedia.tatasky`
 509.0/894 installed on the A15, and the newer `com.tataplay.livetv` 1.0.10/101
 artifact whose native Retrofit layer is recoverable.
 
+> [!NOTE]
+> This provider is compiled only into prerelease builds such as `v1.6.0-beta.2`. A stable release has no Tata Play routes, Settings card or `ost tataplay login` command. See [Install a beta build](../installations-beta/index.md).
+
 ## Provider status
 
 The newer app's verified Retrofit contracts are implemented behind

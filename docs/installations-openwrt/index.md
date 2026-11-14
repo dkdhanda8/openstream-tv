@@ -15,7 +15,7 @@ SSH to the router as `root`. The installer detects `apk` or `opkg`, chooses a su
 | `aarch64` Cortex-A53 | Many ARMv8 routers |
 | `ARM` Cortex-A7 NEON | Older 32-bit ARM routers |
 
-Other router architectures are not published. Set `OPENSTREAM_VERSION` to a release such as `1.5.0` to pin one.
+Other router architectures are not published. Set `OPENSTREAM_VERSION` to a release such as `1.6.0` to pin one, or to a prerelease such as `1.6.0-beta.2` for the beta providers ([Install a beta build](../installations-beta/index.md)).
 
 ```sh
 wget -qO- https://raw.githubusercontent.com/wpfyorg/openstream-tv/main/scripts/install.sh | sh

@@ -23,14 +23,19 @@ Close and reopen PowerShell if `ost` is not found. To pin a version, use `-Versi
 
 ## 🧭 Step 2: Guided Setup
 
-In a PowerShell window the installer switches to a guided setup: build (`full` or `slim`), account (JioTV, JioTV+, Fastway, or Airtel Xstream beta when the release supports it), the address other devices will use, whether to expose the server through Cloudflare, whether to turn on the programme guide, and the account sign-in. Arrow keys (or `j`/`k`, or number keys) select; Enter confirms.
+In a PowerShell window the installer switches to a guided setup: build (`full` or `slim`), account (JioTV, JioTV+ and Fastway, plus each beta provider the installed release supports), the address other devices will use, whether to expose the server through Cloudflare, whether to turn on the programme guide, and the account sign-in. Arrow keys (or `j`/`k`, or number keys) select; Enter confirms.
 
 | Provider | What the wizard asks |
 | :--- | :--- |
 | **JioTV** | Mobile number and one-time password inside the wizard. |
 | **Airtel Xstream** (beta) | Same mobile number and OTP flow. |
+| **PlayboxTV** (beta) | Mobile number and OTP. |
+| **Tata Play** (beta) | Mobile number and OTP; offers the accounts on that number when there is more than one. |
+| **VZY** (beta) | No account; uses the anonymous free tier. |
 | **JioTV+** | Lists registered connections and asks which one to use. |
 | **Fastway** | Username and password. |
+
+Beta options appear only when the installed binary was built with them. A stable installer offers JioTV, JioTV+ and Fastway; pin a prerelease with `-Version 1.6.0-beta.2` to test the others. See [Install a beta build](../installations-beta/index.md).
 
 > [!IMPORTANT]
 > The OTP is masked and provider output is captured rather than printed over the screen. The installer never stores the mobile number or OTP. It saves the selected provider, any named-tunnel token and the guide choice in your Windows user environment. A failed sign-in leaves the binary installed and prints a retry command.
@@ -109,7 +114,7 @@ Installing a pinned release into a custom directory:
 
 ```powershell
 irm https://raw.githubusercontent.com/wpfyorg/openstream-tv/main/scripts/install.ps1 -OutFile install-openstream.ps1
-.\install-openstream.ps1 -Version 1.5.0 -InstallDir "$env:LOCALAPPDATA\OpenStream TV"
+.\install-openstream.ps1 -Version 1.6.0 -InstallDir "$env:LOCALAPPDATA\OpenStream TV"
 ```
 
 ---
