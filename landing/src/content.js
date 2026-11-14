@@ -239,5 +239,5 @@ export const footer = {
     docs: { label: 'Docker and OpenWrt', href: docs },
   },
   legal: '© 2026 OpenStream TV. Source available under CC BY 4.0.',
-  credit: 'Built by Bricks Genius',
+  credit: { label: 'Built by Bricks Genius', href: 'https://bricksgenius.com/' },
 }
