@@ -5,6 +5,17 @@
 //
 // Remark parses `[!IMPORTANT]` on its own line as a shortcut link reference
 // rather than text, so both shapes are recognised here.
+/**
+ * @typedef {object} MarkdownNode
+ * @property {string} [type]
+ * @property {string} [value]
+ * @property {string} [identifier]
+ * @property {string} [label]
+ * @property {MarkdownNode[]} [children]
+ * @property {Record<string, unknown>} [data]
+ */
+
+/** @type {Record<string, string>} */
 const LABELS = {
 	NOTE: 'Note',
 	TIP: 'Tip',
@@ -16,12 +27,14 @@ const LABELS = {
 const TEXT_MARKER = /^\[!(NOTE|TIP|IMPORTANT|WARNING|CAUTION)\]\s*/;
 
 export function remarkCallouts() {
+	/** @param {MarkdownNode} tree */
 	return (tree) => walk(tree);
 }
 
+/** @param {MarkdownNode | undefined} node */
 function markerKind(node) {
 	if (node?.type === 'text') {
-		const match = node.value.match(TEXT_MARKER);
+		const match = node.value?.match(TEXT_MARKER);
 		return match ? match[1] : null;
 	}
 	if (node?.type === 'linkReference') {
@@ -31,14 +44,16 @@ function markerKind(node) {
 	return null;
 }
 
+/** @param {MarkdownNode[]} children */
 function trimLeadingBreak(children) {
 	const next = children[0];
 	if (next?.type === 'text') {
-		next.value = next.value.replace(/^\s*\n/, '');
+		next.value = (next.value ?? '').replace(/^\s*\n/, '');
 		if (!next.value) children.shift();
 	}
 }
 
+/** @param {MarkdownNode} node */
 function walk(node) {
 	if (!node || !Array.isArray(node.children)) return;
 
@@ -48,10 +63,10 @@ function walk(node) {
 			const lead = paragraph?.type === 'paragraph' ? paragraph.children?.[0] : undefined;
 			const kind = markerKind(lead);
 
-			if (kind && lead.type === 'text' && lead.value.match(TEXT_MARKER)) {
-				lead.value = lead.value.replace(TEXT_MARKER, '');
-				if (!lead.value) paragraph.children.shift();
-			} else if (kind) {
+			if (kind && lead && lead.type === 'text' && lead.value?.match(TEXT_MARKER)) {
+				lead.value = (lead.value ?? '').replace(TEXT_MARKER, '');
+				if (!lead.value) paragraph.children?.shift();
+			} else if (kind && paragraph.children) {
 				paragraph.children.shift();
 				trimLeadingBreak(paragraph.children);
 			}
