@@ -101,7 +101,7 @@ Or set the matching environment variable for the process: `OPENSTREAM_PLAYBOX=tr
 
 The guided installer offers the beta providers only when the binary being installed supports them, so the same pinning command above can also connect the account during setup.
 
-![Settings on a beta build showing the JioTV and Fastway cards, a VZY card marked Beta and Active, and the IPTV playlist section](../images/settings-providers.png)
+![Settings on a beta build showing the JioTV and Fastway cards and a VZY card marked Beta and Active](../images/settings-providers.png)
 
 **Expected result:** the enabled provider's card appears in **Settings → Provider login** with a **Beta** pill. Sign in, or select **Use …** to make a connected provider the active catalogue. See [Airtel Xstream](../ott-provider-airtel/index.md), [PlayboxTV](../ott-provider-playbox/index.md), [Tata Play Smart](../ott-provider-tataplay/index.md) and [VZY](../ott-provider-vzy/index.md) for each provider's current limits.
 
