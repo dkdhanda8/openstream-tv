@@ -51,6 +51,6 @@
     class="mx-auto mt-12 flex max-w-[1120px] flex-wrap items-center justify-between gap-2 border-t border-line-soft pt-6 text-xs text-muted"
   >
     <span>{footer.legal}</span>
-    <span>{footer.credit}</span>
+    <a href={footer.credit.href} target="_blank" rel="noreferrer" class="hover:text-fg">{footer.credit.label}</a>
   </p>
 </footer>
