@@ -237,9 +237,10 @@ pub async fn status(State(state): State<SharedState>) -> Response {
     Json(body).into_response()
 }
 
-/// Adds the beta providers' status keys only in builds that contain them.
-/// Stable builds omit the keys entirely, and the UI's optional checks render
-/// no beta cards.
+/// Adds the beta providers' status keys. Every build reports the same keys: a
+/// stable build has no beta provider state, so it reports them disabled and the
+/// UI renders no beta cards. Keeping the shape identical means a client never
+/// has to guess whether a provider key exists.
 fn merge_beta_status(body: &mut serde_json::Value, state: &AppState) {
     #[cfg(feature = "beta")]
     if let Some(map) = body.as_object_mut() {
@@ -293,7 +294,17 @@ fn merge_beta_status(body: &mut serde_json::Value, state: &AppState) {
         );
     }
     #[cfg(not(feature = "beta"))]
-    let _ = (body, state);
+    {
+        let _ = state;
+        if let Some(map) = body.as_object_mut() {
+            for provider in ["airtel", "playbox", "tataplay", "vzy"] {
+                map.insert(
+                    provider.to_string(),
+                    json!({"enabled": false, "connected": false}),
+                );
+            }
+        }
+    }
 }
 
 #[derive(serde::Serialize)]
@@ -2383,10 +2394,12 @@ mod tests {
         }
         #[cfg(not(feature = "beta"))]
         {
-            assert!(json.get("playbox").is_none());
-            assert!(json.get("tataplay").is_none());
-            assert!(json.get("vzy").is_none());
-            assert!(json.get("airtel").is_none());
+            // The keys stay present so the payload shape does not change with
+            // the build; a stable build simply reports them disabled.
+            for provider in ["airtel", "playbox", "tataplay", "vzy"] {
+                assert_eq!(json[provider]["enabled"], false, "{provider} enabled");
+                assert_eq!(json[provider]["connected"], false, "{provider} connected");
+            }
         }
     }
 

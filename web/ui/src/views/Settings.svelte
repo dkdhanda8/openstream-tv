@@ -182,13 +182,13 @@
         {/if}
       </section>
 
-      {#if status.playbox.enabled}
+      {#if status.playbox?.enabled}
         <section class="card">
           <div class="card-head">
             <h2>PlayboxTV <span class="pill beta">Beta</span></h2>
             {#if activeProvider === "playbox"}<span class="pill active">Active</span>{/if}
           </div>
-          {#if status.playbox.connected}
+          {#if status.playbox?.connected}
             <p class="ok">Connected</p>
             {#if activeProvider !== "playbox"}
               <button class="btn" disabled={providerBusy !== ""} onclick={() => activate("playbox")}>Use PlayboxTV</button>
@@ -201,29 +201,31 @@
         </section>
       {/if}
 
-      <section class="card">
-        <div class="card-head">
-          <h2>VZY <span class="pill beta">Beta</span></h2>
-          {#if activeProvider === "vzy"}<span class="pill active">Active</span>{/if}
-        </div>
-        <p class="muted">Free-tier channels only; no account is required.</p>
-        {#if status.vzy.connected}
-          <p class="ok">Free tier available</p>
-          {#if activeProvider !== "vzy"}
-            <button class="btn" disabled={providerBusy !== ""} onclick={() => activate("vzy")}>Use VZY</button>
+      {#if status.vzy?.enabled}
+        <section class="card">
+          <div class="card-head">
+            <h2>VZY <span class="pill beta">Beta</span></h2>
+            {#if activeProvider === "vzy"}<span class="pill active">Active</span>{/if}
+          </div>
+          <p class="muted">Free-tier channels only; no account is required.</p>
+          {#if status.vzy?.connected}
+            <p class="ok">Free tier available</p>
+            {#if activeProvider !== "vzy"}
+              <button class="btn" disabled={providerBusy !== ""} onclick={() => activate("vzy")}>Use VZY</button>
+            {/if}
+          {:else}
+            <p class="muted">The anonymous session is not ready. It is retried automatically.</p>
           {/if}
-        {:else}
-          <p class="muted">The anonymous session is not ready. It is retried automatically.</p>
-        {/if}
-      </section>
+        </section>
+      {/if}
 
-      {#if status.airtel.enabled}
+      {#if status.airtel?.enabled}
         <section class="card">
           <div class="card-head">
             <h2>Airtel Xstream <span class="pill beta">Beta</span></h2>
             {#if activeProvider === "airtel"}<span class="pill active">Active</span>{/if}
           </div>
-          {#if status.airtel.connected}
+          {#if status.airtel?.connected}
             <p class="ok">Connected</p>
             {#if activeProvider !== "airtel"}
               <button class="btn" disabled={providerBusy !== ""} onclick={() => activate("airtel")}>Use Airtel Xstream</button>
@@ -236,13 +238,13 @@
         </section>
       {/if}
 
-      {#if status.tataplay.enabled}
+      {#if status.tataplay?.enabled}
         <section class="card">
           <div class="card-head">
             <h2>Tata Play <span class="pill beta">Beta</span></h2>
             {#if activeProvider === "tataplay"}<span class="pill active">Active</span>{/if}
           </div>
-          {#if status.tataplay.connected}
+          {#if status.tataplay?.connected}
             <p class="ok">Connected</p>
             {#if activeProvider !== "tataplay"}
               <button class="btn" disabled={providerBusy !== ""} onclick={() => activate("tataplay")}>Use Tata Play</button>
