@@ -120,3 +120,33 @@ named by `licensePayloadKey`.
   account and OTP.
 - Channel logos come from the `imgs` map; unusual image shapes fall back to the
   generated placeholder.
+
+## 9. Live-service findings (2026-11-18)
+
+Probed end to end with a signed-in, DTH-linked account (`dth=true`,
+`isDth=true`, `mwTvPack=45003,25002`, `ut=broadband`), from both Airtel
+(AS45609) and Jio (AS55836) egress.
+
+| Call | Result |
+|---|---|
+| `POST api.airtel.tv/v2/user/profile/generateOtp`, colon-joined `x-atv-did` | HTTP 412 `ATV001` |
+| same, pipe-joined `x-atv-did` | HTTP 200 `{"success":true,"message":"SMS sent"}` |
+| `POST api.airtel.tv/v8/user/login` with that OTP | HTTP 200, `uid`/`token`/`authToken` issued |
+| `GET epg.airtel.tv/app/v3/content/channels` | HTTP 200, 1 channel for this account |
+| `GET livetv.airtel.tv/v1/livechannel` | HTTP 200, 783 linear channels (`LIVETV_LIVETVCHANNEL_*`, `lcn`, `title`, `images`, `free`, `streamUrlsAvailable`) |
+| `GET livetv.airtel.tv/v1/epg?channelId=…` | HTTP 200, programme titles |
+| `GET epg.airtel.tv/app/v2/content/channel/epg?channelId=…` | same guide, no auth needed |
+| `GET play.airtel.tv/v4/user/content/playback` | HTTP 404, empty body, every id/appId/header set, both egress networks |
+| `GET play.airtel.tv/v4/user/playback`, `/v5/user/playback` | HTTP 403 `ATV013` unauthenticated; `ATV400` with the account session |
+
+The OTT catalogue (`app/v3/content/channels`) is account-filtered and carries
+the OTT live set only; DTH channels live in the linear catalogue on
+`livetv.airtel.tv`, which returns the master list. `channelNo` arrives as a
+JSON string there and in the OTT list.
+
+Open: the current playback route. `v4/user/content/playback`, the 1.124.6
+contract, is retired on the live service (bare 404), and the surviving
+`user/playback` routes reject every parameter set the shipped APK builds
+(`ATV400`). Resolving it needs a capture of a current client's play request or
+a newer APK than 1.124.6.
+
