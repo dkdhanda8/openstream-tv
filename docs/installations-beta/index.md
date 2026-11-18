@@ -54,8 +54,11 @@ irm https://raw.githubusercontent.com/wpfyorg/openstream-tv/main/scripts/install
 ### OpenWrt
 
 ```sh
-wget -qO- https://raw.githubusercontent.com/wpfyorg/openstream-tv/main/scripts/install.sh | OPENSTREAM_VERSION=1.6.0-beta.2 sh
+wget -O /tmp/openstream-install.sh https://raw.githubusercontent.com/wpfyorg/openstream-tv/main/scripts/install.sh \
+  && OPENSTREAM_VERSION=1.6.0-beta.2 sh /tmp/openstream-install.sh
 ```
+
+The download has to finish before the installer runs, so a failed or truncated download stops at the `&&` instead of feeding an empty script to `sh` and reporting a successful installation.
 
 The installer selects the matching `openstream` or `openstream-slim` package for the router architecture from that prerelease.
 

@@ -35,7 +35,7 @@ If the panel says **No guide for this channel** or **No schedule available**, th
 
 - The provider publishes no schedule for that channel, or publishes it without usable start and end times. PlayboxTV and Tata Play are documented as catalogue-only for this reason.
 - The account is disconnected, so no catalogue or schedule is available.
-- The XMLTV file for external players is a separate setting: `epg = false` stops regeneration, but an existing cache that matches the active account can still be served at `/epg.xml.gz` until it goes stale, even when the in-app guide works.
+- The XMLTV file for external players is a separate setting. `epg = false` stops regeneration only when no saved `epg_enabled` override is set to true (from `ost epg on`) and `OPENSTREAM_COMPANION_APP` is not `1`; otherwise the guide keeps regenerating. With regeneration off, a cache that matches the active account is still served at `/epg.xml.gz`, and nothing expires it by age, so it can be served indefinitely and stay outdated even while the in-app guide works.
 
 For the XMLTV file, see [Configure EPG](../configuration-iptv-epg-streaming/index.md) and [Fix Missing or Stale Programme Guide](../fix-epg-not-updating/index.md).
 
