@@ -37,20 +37,45 @@ function componentSources() {
 const QUOTE = "[\"'`]";
 
 // Matches `status.<key>`, `status?.<key>`, `status["<key>"]` and
-// `status?.["<key>"]`. With `deref`, a `.` must follow the provider, i.e. a
-// property is read off the provider itself; `?.` after the provider is fine.
+// `status?.["<key>"]`. With `deref`, a plain `.` or `[` must follow the
+// provider, i.e. a property is read off the provider itself; the optional
+// forms `?.` and `?.[` short-circuit and are fine. Whitespace is allowed
+// before the read so an expression broken across lines is still caught.
 function statusAccess(keys, { deref = false } = {}) {
   const any = `(?:${keys.join("|")})`;
   const access = `status\\??\\.${any}|status(?:\\?\\.)?\\[${QUOTE}${any}${QUOTE}\\]`;
-  return new RegExp(deref ? `(?:${access})\\.` : access);
+  return new RegExp(deref ? `(?:${access})\\s*(?:\\.|\\[)` : access);
+}
+
+// Blanks out comments, keeping their newlines, so a read quoted in prose is
+// not reported as a live dereference. `//` is only treated as a comment at the
+// start of a line or after punctuation, which leaves `https://` links intact.
+const COMMENT_PATTERNS = [
+  /(?:<!--[\s\S]*?-->|\{\/\*[\s\S]*?\*\/\}|\/\*[\s\S]*?\*\/)/g,
+  /(^|[;{},)])([ \t]*)\/\/[^\n]*/gm,
+];
+
+function maskComments(source) {
+  return COMMENT_PATTERNS.reduce(
+    (text, pattern) => text.replace(pattern, (match) => match.replace(/[^\n]/g, " ")),
+    source,
+  );
 }
 
 function unsafeReads(source) {
+  const lines = source.split("\n");
+  // Scan the whole file so an expression split across lines is one match, but
+  // report the source line the match starts on, once per line.
+  const scan = maskComments(source);
+  const unsafe = new RegExp(statusAccess(OPTIONAL_PROVIDERS, { deref: true }).source, "g");
   const found = [];
-  const unsafe = statusAccess(OPTIONAL_PROVIDERS, { deref: true });
-  source.split("\n").forEach((line, index) => {
-    if (unsafe.test(line)) found.push(`line ${index + 1}: ${line.trim()}`);
-  });
+  const seen = new Set();
+  for (const match of scan.matchAll(unsafe)) {
+    const line = scan.slice(0, match.index).split("\n").length;
+    if (seen.has(line)) continue;
+    seen.add(line);
+    found.push(`line ${line}: ${lines[line - 1].trim()}`);
+  }
   return found;
 }
 
@@ -77,17 +102,27 @@ test("the scan covers the shell and the views that read provider status", () => 
 });
 
 // Returns the body of `{#if <guard>}`, so a test can assert what the guard
-// actually wraps instead of only that the guard text exists somewhere.
+// actually wraps instead of only that the guard text exists. The scan stops at
+// the guard's own `{:else}` (or `{:else if}`), so a card moved into the empty
+// branch cannot satisfy the assertion; branches nested inside the body are
+// kept, and every block type is tracked so their `{:else}` is not mistaken for
+// the guard's.
 function guardedBlock(source, guard) {
   const open = `{#if ${guard}}`;
   const start = source.indexOf(open);
   if (start === -1) return "";
-  const token = /\{#if\b|\{\/if\}/g;
+  const token = /\{#(?:if|each|await|key|snippet)\b|\{\/(?:if|each|await|key|snippet)\}|\{:else\b/g;
   token.lastIndex = start;
-  let depth = 0;
+  const stack = [];
   for (let match = token.exec(source); match; match = token.exec(source)) {
-    depth += match[0] === "{/if}" ? -1 : 1;
-    if (depth === 0) return source.slice(start + open.length, match.index);
+    if (match[0].startsWith("{/")) {
+      stack.pop();
+      if (stack.length === 0) return source.slice(start + open.length, match.index);
+    } else if (match[0].startsWith("{:else")) {
+      if (stack.length === 1) return source.slice(start + open.length, match.index);
+    } else {
+      stack.push(match[0]);
+    }
   }
   return "";
 }
@@ -121,4 +156,41 @@ test("the scan catches a direct read of an omitted provider key", () => {
   assert.deepEqual(unsafeReads("status['vzy']?.connected"), []);
   assert.deepEqual(unsafeReads('{#if status.vzy}{status.vzy?.connected}{/if}'), []);
   assert.deepEqual(unsafeReads("{status?.playbox?.enabled}"), []);
+});
+
+test("the scan reads bracket dereferences but not the optional form", () => {
+  assert.deepEqual(unsafeReads('status.playbox["enabled"]'), ['line 1: status.playbox["enabled"]']);
+  assert.deepEqual(unsafeReads('status?.["playbox"]["enabled"]'), [
+    'line 1: status?.["playbox"]["enabled"]',
+  ]);
+  assert.deepEqual(unsafeReads('status.playbox?.["enabled"]'), []);
+  assert.deepEqual(unsafeReads('status?.["airtel"]?.["enabled"]'), []);
+});
+
+test("the scan follows a read across a line break and skips comments", () => {
+  assert.deepEqual(unsafeReads("status.playbox\n  .enabled"), ["line 1: status.playbox"]);
+  assert.deepEqual(unsafeReads("<!-- {#if status.playbox.enabled} -->"), []);
+  assert.deepEqual(unsafeReads("{/* status.vzy.connected */}"), []);
+  assert.deepEqual(unsafeReads("  // status.tataplay.enabled"), []);
+  assert.deepEqual(unsafeReads('href="https://example.test" status.vzy.connected'), [
+    'line 1: href="https://example.test" status.vzy.connected',
+  ]);
+});
+
+test("the guarded block stops at the guard's own else branch", () => {
+  const card = '<section class="card"><h2>VZY</h2></section>';
+  const withElse = guardedBlock(
+    `{#if status.vzy?.enabled}${card}{:else}<p>off</p>{/if}`,
+    "status.vzy?.enabled",
+  );
+  assert.ok(withElse.includes(card));
+  assert.ok(!withElse.includes("<p>off</p>"));
+  // A nested branch keeps its own else; only the guard's else ends the body.
+  assert.equal(
+    guardedBlock(
+      "{#if status.vzy?.enabled}{#if status.vzy?.connected}a{:else}b{/if}{:else}off{/if}",
+      "status.vzy?.enabled",
+    ),
+    "{#if status.vzy?.connected}a{:else}b{/if}",
+  );
 });
