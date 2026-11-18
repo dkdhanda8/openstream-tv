@@ -54,7 +54,7 @@ irm https://raw.githubusercontent.com/wpfyorg/openstream-tv/main/scripts/install
 ### OpenWrt
 
 ```sh
-OPENSTREAM_VERSION=1.6.0-beta.2 wget -qO- https://raw.githubusercontent.com/wpfyorg/openstream-tv/main/scripts/install.sh | sh
+wget -qO- https://raw.githubusercontent.com/wpfyorg/openstream-tv/main/scripts/install.sh | OPENSTREAM_VERSION=1.6.0-beta.2 sh
 ```
 
 The installer selects the matching `openstream` or `openstream-slim` package for the router architecture from that prerelease.
@@ -109,7 +109,13 @@ The guided installer offers the beta providers only when the binary being instal
 
 ## 🔁 Step 4: Return to Stable
 
-Run `ost update` with no version. It resolves the newest stable release and treats `v1.6.0` as newer than `v1.6.0-beta.2`, so the beta install is replaced by the stable build; restart the server afterwards. Providers that do not exist in a stable build disappear, and a `playbox`, `airtel`, `tataplay` or `vzy` setting is ignored with a startup warning instead of failing the start.
+Run `ost update` with no version. It resolves the newest stable release and treats `v1.6.0` as newer than `v1.6.0-beta.2`, so that beta install is replaced by the stable build; restart the server afterwards. Providers that do not exist in a stable build disappear, and a `playbox`, `airtel`, `tataplay` or `vzy` setting is ignored with a startup warning instead of failing the start.
+
+If the installed prerelease is **newer** than the newest stable release (for example `v1.7.0-beta.1` while `v1.6.0` is latest), an unversioned `ost update` reports that you are up to date and leaves the prerelease installed. Force the stable tag in that case:
+
+```sh
+ost update --version v1.6.0
+```
 
 To move to another prerelease explicitly, use its tag:
 

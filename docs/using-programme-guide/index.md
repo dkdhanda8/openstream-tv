@@ -29,13 +29,13 @@ Long catalogues load in pages of 24 rows as you scroll, and each visible row req
 3. The current programme is marked **NOW** and followed by the upcoming programmes in start-time order.
 4. Hover or tap the video to show its controls and overlays; they hide after inactivity.
 
-If the panel says **No guide for this channel** or **No schedule available**, the provider returned no usable programme data. The channel can still play. Change channel to compare.
+If the panel says **No guide for this channel** or **No schedule available**, the schedule request may have failed, for example on a network or server error, or the provider may have returned no usable programme data; the message does not prove which. The channel can still play. Change channel to compare, and reload before assuming the schedule is missing.
 
 ## Why a guide can be empty
 
 - The provider publishes no schedule for that channel, or publishes it without usable start and end times. PlayboxTV and Tata Play are documented as catalogue-only for this reason.
 - The account is disconnected, so no catalogue or schedule is available.
-- The XMLTV file for external players is a separate setting: `epg = false` leaves `/epg.xml.gz` unavailable even when the in-app guide works.
+- The XMLTV file for external players is a separate setting: `epg = false` stops regeneration, but an existing cache that matches the active account can still be served at `/epg.xml.gz` until it goes stale, even when the in-app guide works.
 
 For the XMLTV file, see [Configure EPG](../configuration-iptv-epg-streaming/index.md) and [Fix Missing or Stale Programme Guide](../fix-epg-not-updating/index.md).
 

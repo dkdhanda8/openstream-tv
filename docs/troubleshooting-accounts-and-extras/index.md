@@ -102,7 +102,7 @@ JioTV+ channels are absent, the UI says JioTV+ is not enabled or connected, OTP 
 
 ### Possible causes
 
-- JioTV+ is disabled by configuration or explicitly locked in Settings.
+- JioTV+ is disabled by configuration, or a saved lock override is hiding it regardless of the `tv_plus` setting.
 - Another provider is active, so only that provider's catalogue is listed.
 - The separate JioTV+ account has not been connected.
 - The account does not have the required entitlement for that item.
@@ -110,11 +110,11 @@ JioTV+ channels are absent, the UI says JioTV+ is not enabled or connected, OTP 
 
 ### Diagnosis
 
-In **Settings**, check whether the JioTV+ card exists and whether it is connected. A missing card means the source is disabled and no unlock override is saved. Then check whether the channel is marked as JioTV+ and whether the message names a plan/entitlement problem. An enabled source does not itself grant a subscription.
+In **Settings**, check whether the JioTV+ card exists and whether it is connected. A missing card means the source is off, either because the `tv_plus` configuration option is disabled or because a saved lock override is suppressing the panel. Turning on `tv_plus` does not clear a saved lock. Then check whether the channel is marked as JioTV+ and whether the message names a plan/entitlement problem. An enabled source does not itself grant a subscription.
 
 ### Solution
 
-Enable JioTV+ in the supported configuration, or type an unlock code issued for this server into the **Channels** search box, which turns the source on and reveals its Settings card. If JioTV+ is already connected but another provider is active, select **Use JioTV+** in Settings to activate it. Complete the JioTV+ OTP flow only when JioTV+ is disconnected; choose the intended connection when prompted. If the UI says the account lacks a plan, check the subscription with the provider; do not try to bypass the entitlement.
+Enable `tv_plus` in the supported configuration. If the card is still missing, a saved lock is in place: type the unlock code issued for this server into the **Channels** search box, which clears the lock, turns the source on and reveals its Settings card. If JioTV+ is already connected but another provider is active, select **Use JioTV+** in Settings to activate it. Complete the JioTV+ OTP flow only when JioTV+ is disconnected; choose the intended connection when prompted. If the UI says the account lacks a plan, check the subscription with the provider; do not try to bypass the entitlement.
 
 ### Verification
 

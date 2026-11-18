@@ -18,4 +18,4 @@ keywords: [on demand, movies, shows, episodes, provider, OTT]
 
 **Expected result:** the selected title's player opens if it is available to the connected account and provider. Catalogues and playback rights vary; an empty section or playback error can reflect account, provider, region, DRM or network limits.
 
-If every section is empty, confirm that JioTV+ is connected and active in **Settings → Provider login**. See [Connect JioTV+](../account-extras/index.md) for the account flow and [Requirements](../getting-started-requirements/index.md) for protected playback.
+If every section is empty, first select **All** in the provider chips: the page remembers the last provider you filtered by, and a remembered filter can hide every title on a section. Then confirm that JioTV+ is connected in **Settings → Provider login**. It does not have to be the active live provider for on-demand titles to load. See [Connect JioTV+](../account-extras/index.md) for the account flow and [Requirements](../getting-started-requirements/index.md) for protected playback.

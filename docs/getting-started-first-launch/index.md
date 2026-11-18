@@ -12,7 +12,7 @@ This guide requires the **full** build, which includes the browser interface. Th
 1. If guided setup already started the service, use its running address; do not start a second copy. Otherwise run `ost serve` on the host in a terminal.
 2. Look for **Web setup** in the server output or service logs. Open the full URL privately in your browser. The URL includes an access key.
 3. Enter a password of eight or more characters, repeat it, then select **Set password**.
-4. Return to the interface and verify that the sidebar shows **Live TV**, **Channels**, **Guide**, **On demand**, and **Settings** after sign-in.
+4. Return to the interface and verify the navigation after sign-in: on screens wider than 900 px the sidebar shows **Live TV**, **Channels**, **Guide**, **On demand**, and **Settings**; at 900 px and narrower the sidebar is hidden and the same five destinations are in the bottom tab bar.
 
 ![OpenStream TV first-launch form asking for an admin password and confirmation](../images/first-launch-setup.png)
 
