@@ -13,7 +13,9 @@ The published image supports Linux `amd64`, `arm64`, ARMv7 and 386; Docker selec
 | :--- | :--- |
 | `latest` | Current full image with the web interface |
 | `slim` | Current headless image for IPTV clients |
-| `1.5.0` / `1.5.0-slim` | A pinned release in either variant |
+| `1.6.0` / `1.6.0-slim` | A pinned release in either variant |
+
+Prerelease tags do not publish Docker images, so the beta providers cannot be pulled from GHCR. Build the beta binary from source and run it directly, or use the stable image. See [Install a beta build](../installations-beta/index.md).
 
 ---
 

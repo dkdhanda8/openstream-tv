@@ -30,6 +30,7 @@ export const sidebarSections: { label: string; items: { label: string; href: str
       { label: 'Install with Docker', href: '/docs/installations-docker' },
       { label: 'Install with Docker Compose', href: '/docs/installations-docker-compose' },
       { label: 'Install Manually from a Release Binary', href: '/docs/installations-manual-binary' },
+      { label: 'Install a Beta (Prerelease) Build', href: '/docs/installations-beta' },
       { label: 'Build OpenStream TV from Source', href: '/docs/installations-build-from-source' },
     ],
   },

@@ -99,7 +99,7 @@ The player stays on loading, DASH fails, the browser reports DRM/Widevine troubl
 
 ## Upstream HTTP security limitation
 
-The v1.5.0 Fastway integration has a material transport limitation: its provider API is `http://fwlivetvapp.netplus.co.in:8080`, and its configured PallyCon license endpoint is also plain HTTP. Fastway credentials/tokens and license traffic therefore do not have TLS protection on those upstream hops. Running OpenStream TV with `--tls` secures your browser-to-server connection only.
+The Fastway integration has a material transport limitation: its provider API is `http://fwlivetvapp.netplus.co.in:8080`, and its configured PallyCon license endpoint is also plain HTTP. Fastway credentials/tokens and license traffic therefore do not have TLS protection on those upstream hops. Running OpenStream TV with `--tls` secures your browser-to-server connection only.
 
 Use Fastway only on a network path you trust, keep the OpenStream data directory private, and never include credentials, access tokens, playlist keys or raw store files in support material. This limitation is separate from whether Widevine itself authorizes a channel.
 

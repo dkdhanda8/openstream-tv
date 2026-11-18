@@ -60,7 +60,7 @@ If you opened `/` before setting a password, the page points you back to the set
 ![OpenStream TV first-launch form asking for an admin password and confirmation](../images/first-launch-setup.png)
 
 > [!NOTE]
-> This password protects the web interface. It is not your provider account and never leaves your server. The screenshot shows the v1.5.0 form reached through the private setup link.
+> This password protects the web interface. It is not your provider account and never leaves your server. The screenshot shows the v1.6.0 form, without the private setup URL.
 
 ---
 
@@ -75,6 +75,8 @@ You can sign in to several providers. Only the **active** one supplies the chann
 
 > [!IMPORTANT]
 > JioTV+, PlayboxTV, Airtel Xstream and Tata Play are disabled by default, and their sign-in endpoints reject requests until they are enabled. Add `tv_plus = true`, `playbox = true`, `airtel = true` or `tataplay = true` to your config file (or start the server with `OPENSTREAM_TVPLUS=true`, `OPENSTREAM_PLAYBOX=true`, `OPENSTREAM_AIRTEL=true` or `OPENSTREAM_TATAPLAY=true`) and restart it. Their OTP sign-in then works, and their cards appear in Settings. On an installed service, an `OPENSTREAM_*` value in the service environment overrides the config file, so set that value to `true` or remove it, then restart the service. See [server configuration](../configuration-reference/index.md) for the file location and every option.
+>
+> PlayboxTV, Airtel Xstream, Tata Play and VZY exist only in a **beta prerelease** build. A stable installation has no card or login command for them; see [Install a beta build](../installations-beta/index.md).
 
 | Situation | Where to go |
 | :--- | :--- |
@@ -87,15 +89,15 @@ You can sign in to several providers. Only the **active** one supplies the chann
 
 ## 📺 Step 5: Watch a Channel
 
-1. Choose **Channels** in the navigation.
-2. Narrow the list with **Search channels**, **Category**, **Language**, or the **HD** filter.
+1. Open **Live TV** for the home screen, or **Channels** in the sidebar for the full grid.
+2. Narrow the list with **Search channels**, **All categories**, **All languages**, or the **HD** filter.
 3. Select a tile — the live player opens.
 4. Use the player controls for pause, volume, quality and full screen.
 
-![OpenStream TV Channels page with a connected JioTV+ catalogue, search and filters](../images/channels-jiotv-plus.png)
+![OpenStream TV Channels page with a connected catalogue, search and filters](../images/channels-vzy.png)
 
 > [!NOTE]
-> The screenshot is a v1.5.0 JioTV+ session. It shows the layout and catalogue rendering; it does not promise that every listed channel plays on every account.
+> The screenshot is a v1.6.0 beta build using the VZY free tier, which needs no account. It shows the layout and catalogue rendering; it does not promise that every listed channel plays on every account or provider.
 
 ---
 

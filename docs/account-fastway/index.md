@@ -32,7 +32,7 @@ Use the Fastway username and password for your subscription; this provider does 
 
 1. Open **Settings** and find the **Fastway** card.
 2. Enter the Fastway username and password, then select **Connect**.
-3. Check that the card says **Connected**. The header shows a Fastway indicator only while Fastway is the active provider.
+3. Check that the card says **Connected**. The top bar shows a Fastway provider pill, and the dot beside the wordmark turns green, only while Fastway is the active provider.
 
 ### Terminal
 
@@ -53,12 +53,12 @@ The password is kept locally because Fastway has no refresh-token endpoint; the 
 
 ---
 
-## ⚠️ Security Limitation in v1.5.0
+## ⚠️ Fastway's Upstream HTTP Limitation
 
 > [!CAUTION]
 > The shipped Fastway client uses a plain-HTTP provider API (`fwlivetvapp.netplus.co.in:8080`) and a plain-HTTP PallyCon license endpoint. The username/password exchange, provider tokens and DRM-license traffic are therefore not protected by TLS on those upstream hops.
 
-Local `ost serve --tls` protects only the browser-to-OpenStream connection; it does not change Fastway's upstream URLs. Avoid Fastway on networks you do not trust, protect the local data directory, and keep credentials and provider tokens out of logs and support requests. This is a transport limitation of the v1.5.0 integration, not a DRM bypass feature.
+Local `ost serve --tls` protects only the browser-to-OpenStream connection; it does not change Fastway's upstream URLs. Avoid Fastway on networks you do not trust, protect the local data directory, and keep credentials and provider tokens out of logs and support requests. This is a transport limitation of the Fastway integration, not a DRM bypass feature, and it has not changed in the current release.
 
 ---
 

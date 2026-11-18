@@ -12,6 +12,7 @@ Start with the **[Help Centre](help-centre/index.md)** if you are new, or jump s
 | :--- | :--- |
 | Install it for the first time | [Getting Started in 5 Minutes](getting-started-in-5-minutes/index.md) |
 | Pick the right platform | [Installation](installations/index.md) → Linux, macOS, Windows, OpenWrt, SBC, Termux, Docker |
+| Try the beta providers | [Install a beta (prerelease) build](installations-beta/index.md) |
 | Sign in to a provider | [Accounts](account/index.md), [JioTV+](account-extras/index.md), [Fastway](account-fastway/index.md) |
 | Watch, browse or use the guide | [Using OpenStream TV](using/index.md) |
 | Add it to VLC, Kodi or TiviMate | [IPTV playlist and EPG](configuration-iptv-epg-streaming/index.md) |
@@ -34,6 +35,8 @@ Start with the **[Help Centre](help-centre/index.md)** if you are new, or jump s
 | **VZY** | Beta | free tier, no account |
 
 You can sign in to several providers; the **active** one supplies the channel list. Switch it in Settings or with `ost provider use <provider>`.
+
+The four beta providers are compiled only into prerelease builds such as `v1.6.0-beta.2`. A stable download and the `latest` release contain JioTV, JioTV+ and Fastway only; see [Install a beta build](installations-beta/index.md).
 
 ---
 

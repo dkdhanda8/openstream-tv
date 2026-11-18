@@ -7,7 +7,7 @@ keywords: [Android, Termux, phone, tablet, aarch64, ARMv7]
 
 # 📱 Install on Android with Termux
 
-Install Termux from a trusted distribution source and open its terminal. The installer detects Termux and picks a supported Android target (`aarch64`, ARMv7 or `x86_64`); it downloads the latest matching GitHub release unless `OPENSTREAM_VERSION` pins one, such as `1.5.0`.
+Install Termux from a trusted distribution source and open its terminal. The installer detects Termux and picks a supported Android target (`aarch64`, ARMv7 or `x86_64`); it downloads the latest matching GitHub release unless `OPENSTREAM_VERSION` pins one, such as `1.6.0` (or a prerelease such as `1.6.0-beta.2` for the beta providers).
 
 ```sh
 pkg update
@@ -21,7 +21,7 @@ The binary installs to Termux's `$PREFIX/bin`.
 
 ## 🧭 Step 1: Guided Setup
 
-The installer runs the guided setup in the Termux terminal: build (`full` or `slim`), account (JioTV, JioTV+, Fastway, or Airtel Xstream beta when the release supports it), the address other devices will use, an optional Cloudflare tunnel, whether to turn on the programme guide, and the account sign-in. Arrow keys select and Enter confirms.
+The installer runs the guided setup in the Termux terminal: build (`full` or `slim`), account (JioTV, JioTV+ and Fastway, plus each beta provider the installed release supports), the address other devices will use, an optional Cloudflare tunnel, whether to turn on the programme guide, and the account sign-in. Arrow keys select and Enter confirms.
 
 > [!IMPORTANT]
 > Guided setup writes the provider settings and guide choice to `${XDG_CONFIG_HOME:-$HOME/.config}/openstream/installer.env`, but they are **not** loaded back into the Termux shell that ran the installer. Before a manual `ost serve` or before rerunning `ost autostart`, source that file — or reuse the installer's printed `Start it with:` command, which already sources it. When autostart succeeded the installer may print no start command at all, so source the file yourself for any manual step. Configuring autostart only affects future startup and never loads those settings into the current shell.

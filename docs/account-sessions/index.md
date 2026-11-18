@@ -15,8 +15,8 @@ The web interface keeps an admin session in your browser. Signing out of the web
 
 | Window width | How to sign out |
 | :--- | :--- |
-| 901px and wider | **Sign out** at the bottom of the sidebar |
-| 900px and narrower | **Settings** → **This browser** → **Sign out**, because the sidebar is hidden at that width |
+| 901px and wider | The sign-out icon at the bottom of the sidebar, beside **Admin / Web session** |
+| 900px and narrower | **Settings → Security → This browser → Sign out**, because the sidebar is hidden at that width |
 
 Sign in again with the admin password when you return.
 

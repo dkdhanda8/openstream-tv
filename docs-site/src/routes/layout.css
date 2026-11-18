@@ -202,6 +202,14 @@ html.dark .code-block-title {
 	-webkit-overflow-scrolling: touch;
 }
 
+/* Tailwind Typography wraps inline code in typographic backticks. The articles
+   already use backticks as Markdown, so those pseudo-elements only duplicate
+   the marker in the rendered text. Code blocks keep their own styling. */
+.prose :where(code):not(:where(pre code))::before,
+.prose :where(code):not(:where(pre code))::after {
+	content: none;
+}
+
 @custom-variant data-open {
 	&:where([data-state="open"]), &:where([data-open]:not([data-open="false"])) {
 		@slot;

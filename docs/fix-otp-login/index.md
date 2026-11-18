@@ -8,7 +8,7 @@ keywords: [OTP, login, phone, sign in, code expired, authentication, session]
 # Fix JioTV OTP Login
 
 ## Symptoms
-The OTP never arrives, a code is rejected, or the JioTV card remains **Not logged in** after you finish signing in.
+The OTP never arrives, a code is rejected, or the JioTV card still shows its **Log in with a JioTV mobile number** form after you finish signing in.
 
 ## Possible causes
 The number or code is wrong, the code expired, the provider rejected the request, the account requires another verification step, or the stored session is no longer valid.
@@ -25,7 +25,7 @@ The number or code is wrong, the code expired, the provider rejected the request
 4. If the provider is unavailable, wait until it accepts login again.
 
 ## Verification
-The JioTV card should show **Logged in**; then visit **Channels** and confirm the catalogue loads. Successful login does not guarantee access to every subscription channel.
+The JioTV card should show **Logged in** and an **Active** pill; then visit **Channels** and confirm the catalogue loads. Successful login does not guarantee access to every subscription channel.
 
 ## Further help
 Provide a redacted error, login method, app version, time and account status only. Never share OTP, password, cookie, token or phone number. See [connect an account](../account-connect-jiotv/index.md) and [account troubleshooting](../troubleshooting-accounts-and-extras/index.md).

@@ -9,7 +9,7 @@ keywords: [JioTV, account, OTP, mobile number, sign in]
 
 The JioTV account supplies the channels available to your own subscription. It is separate from the admin password you use to open this server.
 
-![Settings showing the JioTV mobile-number sign-in card while JioTV+ is connected separately](../images/settings-jiotv-plus.png)
+![Settings showing the JioTV mobile-number sign-in card beside the Fastway and VZY cards](../images/settings-providers.png)
 
 ---
 
@@ -19,7 +19,7 @@ The JioTV account supplies the channels available to your own subscription. It i
 2. Open **Settings** and find the **JioTV** card.
 3. Enter the 10-digit mobile number for your JioTV account and select **Send OTP**.
 4. Enter the code sent to that number, then select **Log in**.
-5. Check that the card says **Logged in**, then return to **Channels**.
+5. Check that the card says **Logged in**, then return to **Channels** — signing in also makes JioTV the active provider.
 
 **Expected result:** the JioTV account status is logged in and the channel list loads the channels available to that account. An individual channel can still need a subscription or be unavailable from the provider.
 

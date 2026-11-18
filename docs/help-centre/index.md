@@ -7,7 +7,7 @@ keywords: [JioTV, help, manual, installation, live TV]
 
 # 📺 OpenStream TV Help Centre
 
-OpenStream TV is one Rust binary that serves live TV, catch-up, a seven-day guide and an IPTV playlist from your own machine, with a web player and settings panel included. Sign in to your provider once, then watch from a browser, a TV box or any IPTV app on your network.
+OpenStream TV is one Rust binary that serves live TV, a seven-day guide and an IPTV playlist from your own machine, with a web player and settings panel included. Sign in to your provider once, then watch from a browser, a TV box or any IPTV app on your network.
 
 **New here?** [Getting Started in 5 Minutes](../getting-started-in-5-minutes/index.md) sets the admin password, connects a provider and gets you to the channel list.
 
@@ -19,6 +19,7 @@ OpenStream TV is one Rust binary that serves live TV, catch-up, a seven-day guid
 | :--- | :--- |
 | Get it running today | [Getting Started](../getting-started/index.md) |
 | Install on Linux, macOS, Windows, OpenWrt, an SBC, Termux or Docker | [Installation](../installations/index.md) |
+| Try the beta providers | [Install a beta build](../installations-beta/index.md) |
 | Understand what a provider account is | [Accounts](../account/index.md) |
 | Sign in to JioTV+ | [JioTV+ account](../account-extras/index.md) |
 | Sign in to Fastway | [Fastway account](../account-fastway/index.md) |
@@ -34,11 +35,11 @@ OpenStream TV is one Rust binary that serves live TV, catch-up, a seven-day guid
 | Capability | Detail |
 | :--- | :--- |
 | **Live TV** | Provider channels proxied through your server behind a protected local URL. |
-| **Catch-up** | Programmes the provider keeps for replay. |
+| **Catch-up** | Provider catch-up data is supported by server routes; the current web UI has no catch-up browser. |
 | **Guide** | Seven-day EPG in the UI plus `epg.xml.gz` for IPTV clients. |
 | **Playlist** | `playlist.m3u` for VLC, Kodi, TiviMate and OTT Navigator. |
-| **Web UI** | Home rows, channel grid, guide, player, settings. |
-| **Providers** | JioTV, JioTV+, Fastway stable; Airtel Xstream, Tata Play, PlayboxTV, VZY beta. |
+| **Web UI** | Live TV home, channel grid, programme guide, player and settings. |
+| **Providers** | JioTV, JioTV+, Fastway stable; Airtel Xstream, Tata Play, PlayboxTV, VZY beta, in prerelease builds only. |
 | **Remote access** | Optional TLS or a Cloudflare tunnel. |
 
 ---

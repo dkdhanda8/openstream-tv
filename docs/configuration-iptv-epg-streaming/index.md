@@ -25,7 +25,7 @@ For headless and slim installs, `ost epg on` stores a persistent EPG override in
 
 The full web interface shows playlist and EPG links in **Settings**. A protected installation uses `/k/<key>/playlist.m3u` and `/k/<key>/epg.xml.gz`. If authentication is deliberately disabled, the paths are `/playlist.m3u` and `/epg.xml.gz` and access-key rotation is unavailable. Do not replace the full link with a guessed path; use **Copy** for the link supplied by your server.
 
-![Settings shows the M3U and EPG locations and warns that the playlist must stay private](../images/settings-jiotv-plus.png)
+The **Playlist and guide links** card in **Settings → IPTV playlist & EPG** shows both URLs and warns that anyone with the playlist URL can watch.
 
 If you choose **Make a new key**, clients with old links stop working. Copy the new URL to every IPTV app. The key belongs only to your local server; it does not change your provider subscription.
 
