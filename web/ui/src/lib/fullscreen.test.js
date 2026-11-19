@@ -7,6 +7,19 @@ function touchMedia(coarse = true) {
   return (query) => ({ matches: coarse && query.includes("pointer: coarse") });
 }
 
+function fakeDocument() {
+  const listeners = new Map();
+  return {
+    webkitFullscreenElement: null,
+    listeners,
+    addEventListener(type, handler) { listeners.set(type, handler); },
+    removeEventListener(type, handler) {
+      if (listeners.get(type) === handler) listeners.delete(type);
+    },
+    emit(type) { listeners.get(type)?.(); },
+  };
+}
+
 test("pointer focus inside the player does not pin the controls open", () => {
   const button = { matches: (selector) => selector === ":focus-visible" && false };
   const container = { contains: (node) => node === button };
@@ -59,11 +72,23 @@ test("element fullscreen prefers the standard API and falls back to WebKit", asy
   assert.equal(supportsElementFullscreen(standard), true);
   assert.equal(await requestElementFullscreen(standard), "standard");
 
-  const calls = [];
-  const prefixed = { webkitRequestFullscreen: () => calls.push("enter") };
+  const doc = fakeDocument();
+  const prefixed = { webkitRequestFullscreen: () => {} };
   assert.equal(supportsElementFullscreen(prefixed), true);
-  await requestElementFullscreen(prefixed);
-  assert.deepEqual(calls, ["enter"]);
+  const pending = requestElementFullscreen(prefixed, doc);
+  assert.equal(doc.listeners.size, 2);
+  doc.webkitFullscreenElement = prefixed;
+  doc.emit("webkitfullscreenchange");
+  await pending;
+  assert.equal(doc.listeners.size, 0);
+});
+
+test("prefixed fullscreen rejects when WebKit reports an error", async () => {
+  const doc = fakeDocument();
+  const pending = requestElementFullscreen({ webkitRequestFullscreen: () => {} }, doc);
+  doc.emit("webkitfullscreenerror");
+  await assert.rejects(pending, /refused/);
+  assert.equal(doc.listeners.size, 0);
 });
 
 test("element fullscreen reports unsupported containers", async () => {

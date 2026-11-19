@@ -12,11 +12,29 @@ export function supportsElementFullscreen(element) {
   return typeof element?.requestFullscreen === "function" || typeof element?.webkitRequestFullscreen === "function";
 }
 
-export function requestElementFullscreen(element) {
+export function requestElementFullscreen(element, doc = globalThis.document) {
   if (typeof element?.requestFullscreen === "function") return element.requestFullscreen();
   if (typeof element?.webkitRequestFullscreen === "function") {
-    element.webkitRequestFullscreen();
-    return Promise.resolve();
+    // The prefixed API reports failure through an event, not a rejected
+    // promise, so wait for the matching change/error before settling.
+    return new Promise((resolve, reject) => {
+      const cleanup = () => {
+        doc.removeEventListener("webkitfullscreenchange", onChange);
+        doc.removeEventListener("webkitfullscreenerror", onError);
+      };
+      const onChange = () => {
+        if (doc.webkitFullscreenElement !== element) return;
+        cleanup();
+        resolve();
+      };
+      const onError = () => {
+        cleanup();
+        reject(new Error("element fullscreen was refused"));
+      };
+      doc.addEventListener("webkitfullscreenchange", onChange);
+      doc.addEventListener("webkitfullscreenerror", onError);
+      element.webkitRequestFullscreen();
+    });
   }
   return null;
 }
