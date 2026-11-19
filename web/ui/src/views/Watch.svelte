@@ -119,7 +119,7 @@
     showMeta = true;
     clearTimeout(activityTimer);
     activityTimer = setTimeout(function hideMeta() {
-      if (shouldKeepControlsVisible(playerContainer)) {
+      if (showQualityMenu || showMoreMenu || shouldKeepControlsVisible(playerContainer)) {
         activityTimer = setTimeout(hideMeta, 3000);
         return;
       }
@@ -507,13 +507,22 @@
       setPlayerState("reconnecting", "Live TV", "Reconnecting live stream…", "");
       start(id, quality);
     };
+    // Browser UI and the system back gesture can leave fullscreen without
+    // going through toggleFullscreen, so release the orientation lock here.
+    const onFullscreenChange = () => {
+      if (document.fullscreenElement) return;
+      unlockOrientation();
+      markActivity();
+    };
     window.addEventListener("offline", onOffline);
     window.addEventListener("online", onOnline);
+    document.addEventListener("fullscreenchange", onFullscreenChange);
     markActivity();
     return () => {
       clearInterval(clockTimer);
       window.removeEventListener("offline", onOffline);
       window.removeEventListener("online", onOnline);
+      document.removeEventListener("fullscreenchange", onFullscreenChange);
     };
   });
 
