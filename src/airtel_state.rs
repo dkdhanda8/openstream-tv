@@ -473,12 +473,18 @@ impl AirtelState {
         let end = now.saturating_add(EPG_WINDOW.as_millis() as i64);
         let mut sources = Vec::new();
         let mut programmes = Vec::new();
+        let mut fetched = 0usize;
         for channel in &channels {
             let id = channel_id(&channel.id);
             sources.push((id.clone(), channel.title.clone()));
-            let Ok(programs) = client.channel_epg(store, &channel.id, start, end).await else {
-                continue;
+            let programs = match client.channel_epg(store, &channel.id, start, end).await {
+                Ok(programs) => programs,
+                Err(error) => {
+                    tracing::warn!("airtel: guide unavailable for {}: {error}", channel.id);
+                    continue;
+                }
             };
+            fetched += 1;
             {
                 for program in &programs {
                     programmes.push(crate::epg::XmlProgramme {
@@ -492,6 +498,9 @@ impl AirtelState {
                     });
                 }
             }
+        }
+        if fetched == 0 && !channels.is_empty() {
+            anyhow::bail!("airtel: no channel guide could be loaded");
         }
         Ok((sources, programmes))
     }
@@ -752,6 +761,67 @@ mod tests {
         assert_eq!(creds.uid, "uid");
         assert!(crate::airtel::Credentials::load(&store).is_none());
         assert!(!state.connected());
+    }
+
+    #[tokio::test]
+    async fn epg_source_errors_when_every_channel_guide_fails() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/v1/livechannel"))
+            .respond_with(ResponseTemplate::new(200).set_body_raw(
+                r#"{"success":true,"data":[{"id":"1001","title":"Star Plus","cp":"MWTV","images":{}}]}"#,
+                "application/json",
+            ))
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/app/v2/content/channel/epg"))
+            .respond_with(ResponseTemplate::new(500))
+            .mount(&server)
+            .await;
+        let state = AirtelState::new(true);
+        state.set_client_for_test(client_for(&server));
+        let dir = tempfile::tempdir().unwrap();
+        let store = crate::store::Store::open(dir.path().to_str().unwrap()).unwrap();
+        assert!(state.epg_source(&store).await.is_err());
+    }
+
+    #[tokio::test]
+    async fn epg_source_keeps_partial_guides() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/v1/livechannel"))
+            .respond_with(ResponseTemplate::new(200).set_body_raw(
+                r#"{"success":true,"data":[
+                    {"id":"1001","title":"One","cp":"MWTV","images":{}},
+                    {"id":"2002","title":"Two","cp":"MWTV","images":{}}
+                ]}"#,
+                "application/json",
+            ))
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/app/v2/content/channel/epg"))
+            .and(query_param("channelId", "1001"))
+            .respond_with(ResponseTemplate::new(200).set_body_raw(
+                r#"{"programGuide":{"1001":[{"title":"Show","startTime":1700000000000,"endTime":1700003600000}]}}"#,
+                "application/json",
+            ))
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/app/v2/content/channel/epg"))
+            .and(query_param("channelId", "2002"))
+            .respond_with(ResponseTemplate::new(500))
+            .mount(&server)
+            .await;
+        let state = AirtelState::new(true);
+        state.set_client_for_test(client_for(&server));
+        let dir = tempfile::tempdir().unwrap();
+        let store = crate::store::Store::open(dir.path().to_str().unwrap()).unwrap();
+        let (_sources, programmes) = state.epg_source(&store).await.unwrap();
+        assert_eq!(programmes.len(), 1);
+        assert_eq!(programmes[0].title, "Show");
     }
 
     #[tokio::test]

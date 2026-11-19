@@ -230,7 +230,7 @@ pub struct AirtelChannel {
     pub id: String,
     #[serde(default)]
     pub title: String,
-    #[serde(default, rename = "channelNo")]
+    #[serde(default, rename = "channelNo", deserialize_with = "de_channel_no")]
     pub channel_no: Option<i64>,
     #[serde(default)]
     pub hd: bool,
@@ -241,6 +241,24 @@ pub struct AirtelChannel {
     /// The linear catalogue spells the field `images`.
     #[serde(default, alias = "images")]
     pub imgs: HashMap<String, String>,
+}
+
+fn de_channel_no<'de, D>(deserializer: D) -> Result<Option<i64>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    #[derive(Deserialize)]
+    #[serde(untagged)]
+    enum Raw {
+        Number(i64),
+        Text(String),
+    }
+
+    Ok(match Option::<Raw>::deserialize(deserializer)? {
+        None => None,
+        Some(Raw::Number(number)) => Some(number),
+        Some(Raw::Text(text)) => text.trim().parse::<i64>().ok(),
+    })
 }
 
 impl AirtelChannel {
@@ -1275,6 +1293,25 @@ mod tests {
             header,
             "v72UE-WQrmdaed_gi53xZLV5pa02:QwTQjPcE7APkzby88Moo8C+Z0Jc="
         );
+    }
+
+    #[test]
+    fn channel_numbers_parse_as_strings_and_numbers() {
+        let text: AirtelChannel = serde_json::from_str(
+            r#"{"id":"MWTV_LIVETVCHANNEL_1","title":"Republic","channelNo":"101","images":{"LOGO":"https://cdn/1.png"}}"#,
+        )
+        .expect("string channelNo");
+        assert_eq!(text.channel_no, Some(101));
+        assert_eq!(text.logo(), "https://cdn/1.png");
+
+        let number: AirtelChannel =
+            serde_json::from_str(r#"{"id":"1","title":"News","channelNo":154}"#)
+                .expect("numeric channelNo");
+        assert_eq!(number.channel_no, Some(154));
+
+        let missing: AirtelChannel =
+            serde_json::from_str(r#"{"id":"1","title":"News"}"#).expect("absent channelNo");
+        assert_eq!(missing.channel_no, None);
     }
 
     #[test]
