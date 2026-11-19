@@ -32,6 +32,8 @@ This v1.6.0 capture uses the VZY free tier on a beta build, and its video was pl
 
 **Expected result:** playback starts and programme details appear when the channel provides guide data. Quality choices are requests; the available stream may limit the result.
 
+On a phone, fullscreen rotates supported mobile browsers to landscape. The player controls fade after a few seconds; tap the player to bring them back. iPhone Safari uses its native video player instead, which follows the device orientation.
+
 If the player cannot start the stream it shows **Playback unavailable** with **Try again** and **All channels** actions. Protected playback may need HTTPS, a supported browser and working Widevine support. Account rights and provider availability also affect playback. See [Requirements](../getting-started-requirements/index.md) and [Network access and HTTPS](../configuration-network-security/index.md).
 
 ## Read the full guide
