@@ -214,3 +214,25 @@ derivable from OTT credentials. Without the box, the OTT catalogue
 
 
 
+
+## 11. Working linear playback (2026-11-20)
+
+The `v3` route plus three transport details make live channels play without
+the STB, but only for partners the play API itself serves.
+
+| Change | Evidence |
+|---|---|
+| `x-atv-did` must be pipe-joined | colon-joined → `412 ATV202`/`ATV001`; pipe-joined → `200` |
+| `livetv.airtel.tv` 404s any request advertising gzip | `accept-encoding: gzip` → `404` (121 B); `identity` → `200` (797,843 B) |
+| playback is `v3/user/content/playback` | `v4/user/content/playback` → bare `404` |
+| `x-atv-cp` must be the channel's partner | no cp → `ATV030 Content Partner is invalid`; `MWTV` → `200` |
+| Airtel's own live pack is STB-only | `LIVETV` → `ATV001` on the v3 route, `iptv: true` in the catalogue |
+
+`PLAYABLE_LINEAR_CPS` therefore starts as `["MWTV"]`: those five channels
+resolve to a direct HLS URL with `isDrm: false` and play through the normal
+proxy. Everything else in the 783-channel linear catalogue answers `ATV030`
+(partner not served by the play API) or `ATV001` (Airtel live pack), and the
+`iptv-playback.airtel.tv` host remains box-gated.
+
+End-to-end check: `/live/airtel_MWTV_LIVETVCHANNEL_10000000063500000.m3u8`
+returns the HLS master, the variant playlist and a 3.4 MB segment.
