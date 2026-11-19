@@ -187,15 +187,30 @@ Routes built by `data/repo/PlayerRepository`:
 `sh`, `resolution`, `cdnId`.
 
 Probed with a valid phone session: `GET /playback/v2/info` → `401 ATV013
-"Request not authenticated"`, with and without empty box headers. The chip id,
-box serial and `x-box-auth-*` values are provisioned to the physical box, so
-linear/DTH playback is bound to STB identity and cannot be produced from an OTT
-or phone session. Box identity also feeds `x-atv-dth-subscriber-id` in the
-JWT-less DTH flow.
+"Request not authenticated"`, with and without empty box headers. The gate is
+box identity, not a server secret: `BoxAuthDetails` derives it entirely on the
+device.
 
-Consequence for this provider: the OTT catalogue (account-entitled,
-`app/v3/content/channels`) is the only playable surface reachable without STB
-credentials; the 783-channel linear catalogue on `livetv.airtel.tv` is
-enumerable and its EPG is public, but its playback requires the box.
+```
+scramble = matrix-shuffle(chipId + bsn + macId + time, rows = floor(sqrt(n)))
+key      = AES-urlsafe("chipId|bsn|macId|time", "u9mH9s5T7S8sdfkJ3lK1lA==")
+value    = "v=v1;s=" + base64url(HMAC-SHA256(scramble, key = str(time)))
+```
+
+The AES key is hardcoded in the APK, so both headers are reproducible off-box.
+`getIptvChipId()` reads `readPropFromVmx("uniqueIdentifier")`, `getIptvBsnId()`
+reads the matching vendor property, `macId` comes from the network interface.
+What cannot be invented is which box is linked to the account, and
+`v1/box/detail` resolves `chipId`/`bsn`/`macId` to the DTH `subscriberId` that
+`playback/v2/info` requires as `x-atv-dth-subscriber-id`. A second gate is
+likely: `linearHeartBeatApiUrl` is `iptvhb.airtel.com/v1/network/validation`,
+i.e. the box's network is validated too.
+
+Consequence: linear/DTH playback is reachable only with the identity of an STB
+that is actually linked to the account — readable on that box over ADB, not
+derivable from OTT credentials. Without the box, the OTT catalogue
+(`app/v3/content/channels`) remains the only playable surface, and the
+783-channel linear catalogue on `livetv.airtel.tv` stays display-only.
+
 
 
