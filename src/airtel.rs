@@ -10,7 +10,6 @@
 //!
 //! Every middleware call carries `appId=MOBILITY` and an `x-atv-utkn` header:
 //! `uid + ":" + base64(HMAC-SHA1(uid's token, METHOD + path + "?" + query + body))`.
-//! Logged-in calls also append the account's content properties (`cp`, `cl`,
 //! `ln`, ...) as query parameters on the catalogue, EPG, content and package
 //! hosts. Anonymous calls are signed with the app's own fallback identity and
 //! can read `appConfig` but get an empty channel list: the catalogue, EPG and
@@ -186,26 +185,6 @@ impl Credentials {
     pub fn save(&self, store: &crate::store::Store) -> anyhow::Result<()> {
         store.set(STORE_KEY_CREDENTIALS, &serde_json::to_string(self)?)?;
         Ok(())
-    }
-
-    /// Content properties plus the derived `cl`/`ln` when the account did not
-    /// spell them out.
-    fn properties(&self) -> Vec<(String, String)> {
-        let mut out: Vec<(String, String)> = self
-            .content_properties
-            .iter()
-            .filter(|(k, v)| !k.is_empty() && !v.is_empty())
-            .map(|(k, v)| (k.clone(), v.clone()))
-            .collect();
-        out.sort_by(|a, b| a.0.cmp(&b.0));
-        let has = |out: &Vec<(String, String)>, key: &str| out.iter().any(|(k, _)| k == key);
-        if !self.circle.is_empty() && !has(&out, "cl") {
-            out.push(("cl".to_string(), self.circle.clone()));
-        }
-        if !has(&out, "ln") {
-            out.push(("ln".to_string(), self.language_or_default()));
-        }
-        out
     }
 
     pub fn language_or_default(&self) -> String {
@@ -502,7 +481,6 @@ struct RequestSpec<'a> {
     path: &'a str,
     query: Vec<(String, String)>,
     body: Option<String>,
-    properties: bool,
     headers: Vec<(String, String)>,
 }
 
@@ -514,7 +492,6 @@ impl<'a> RequestSpec<'a> {
             path,
             query: Vec::new(),
             body: None,
-            properties: false,
             headers: Vec::new(),
         }
     }
@@ -526,7 +503,6 @@ impl<'a> RequestSpec<'a> {
             path,
             query: Vec::new(),
             body: Some(body),
-            properties: false,
             headers: Vec::new(),
         }
     }
@@ -626,15 +602,6 @@ impl Client {
         let mut pairs: Vec<(String, String)> = Vec::with_capacity(spec.query.len() + 8);
         pairs.push(("appId".to_string(), APP_ID.to_string()));
         pairs.extend(spec.query);
-        if spec.properties {
-            if let Some(creds) = creds {
-                for (key, value) in creds.properties() {
-                    if key != "appId" {
-                        pairs.push((key, value));
-                    }
-                }
-            }
-        }
         let encoded: Vec<String> = pairs
             .iter()
             .map(|(k, v)| format!("{}={}", urlencoding::encode(k), urlencoding::encode(v)))
