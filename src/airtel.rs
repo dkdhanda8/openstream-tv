@@ -912,17 +912,9 @@ impl Client {
         &self,
         _store: &crate::store::Store,
     ) -> anyhow::Result<Vec<AirtelChannel>> {
-        let response = self
-            .linear_channels_request()
-            .send()
-            .await
-            .map_err(|e| anyhow::anyhow!("airtel: channel list failed: {e}"))?;
-        let status = response.status().as_u16();
-        let bytes = response
-            .bytes()
-            .await
-            .map_err(|e| anyhow::anyhow!("airtel: channel list body failed: {e}"))?
-            .to_vec();
+        let (status, bytes) = self
+            .send(self.linear_channels_request(), "livechannel")
+            .await?;
         let value: serde_json::Value = serde_json::from_slice(&bytes).unwrap_or_default();
         if !(200..300).contains(&status) {
             anyhow::bail!(
@@ -984,10 +976,7 @@ impl Client {
                 .unwrap_or(serde_json::Value::Null),
         )
         .unwrap_or_default();
-        Ok(guide
-            .remove(content_id)
-            .or_else(|| guide.into_values().next())
-            .unwrap_or_default())
+        Ok(guide.remove(content_id).unwrap_or_default())
     }
 
     /// `v3/user/content/playback` is the route the current clients use; it
@@ -1216,7 +1205,9 @@ mod sha1 {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use wiremock::matchers::{body_string_contains, header_exists, method, path, query_param};
+    use wiremock::matchers::{
+        body_string_contains, header, header_exists, method, path, query_param,
+    };
     use wiremock::{Mock, MockServer, ResponseTemplate};
 
     fn client(server: &MockServer) -> Client {
@@ -1429,6 +1420,7 @@ mod tests {
         Mock::given(method("GET"))
             .and(path("/v3/user/content/playback"))
             .and(query_param("contentId", "1001"))
+            .and(header("x-atv-cp", "MWTV"))
             .respond_with(ResponseTemplate::new(200).set_body_raw(
                 r#"{"eligibleForPlayback":true,"playId":"https://cdn/1001/hls.m3u8","playbackType":"URL","isDrm":false,"message":"success","cp":"MWTV"}"#,
                 "application/json",
@@ -1440,6 +1432,7 @@ mod tests {
             uid: "uid".into(),
             token: "token".into(),
             language: "hi".into(),
+            content_properties: HashMap::from([("cp".to_string(), "AIRTEL".to_string())]),
             ..Default::default()
         });
         let dir = tempfile::tempdir().unwrap();
