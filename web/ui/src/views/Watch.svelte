@@ -3,6 +3,7 @@
   import { fade } from "svelte/transition";
   import { api, loadChannels, formatTime } from "../lib/api.js";
   import { recordWatch } from "../lib/history.js";
+  import { lockLandscape, shouldKeepControlsVisible, unlockOrientation } from "../lib/fullscreen.js";
   import {
     createShakaPlayer,
     loadLiveSource,
@@ -118,7 +119,7 @@
     showMeta = true;
     clearTimeout(activityTimer);
     activityTimer = setTimeout(function hideMeta() {
-      if (playerContainer?.contains(document.activeElement)) {
+      if (shouldKeepControlsVisible(playerContainer)) {
         activityTimer = setTimeout(hideMeta, 3000);
         return;
       }
@@ -188,13 +189,25 @@
     try {
       if (document.fullscreenElement) {
         await document.exitFullscreen?.();
-      } else if (video?.webkitDisplayingFullscreen) {
-        video.webkitExitFullscreen?.();
-      } else if (playerContainer?.requestFullscreen) {
-        await playerContainer.requestFullscreen();
-      } else {
-        video?.webkitEnterFullscreen?.();
+        unlockOrientation();
+        return;
       }
+      if (video?.webkitDisplayingFullscreen) {
+        video.webkitExitFullscreen?.();
+        return;
+      }
+      // Element fullscreen keeps the custom controls on Android and desktop;
+      // touch browsers only rotate when we lock the page to landscape after
+      // the request is granted. iOS has no orientation lock, so native video
+      // fullscreen stays the fallback there.
+      if (playerContainer?.requestFullscreen) {
+        try {
+          await playerContainer.requestFullscreen();
+          await lockLandscape();
+          return;
+        } catch {}
+      }
+      video?.webkitEnterFullscreen?.();
     } catch {}
   }
 
@@ -808,6 +821,21 @@
     border-radius: 16px;
     overflow: hidden;
     box-shadow: 0 22px 60px rgba(0, 0, 0, .28);
+  }
+  /* Fullscreen owns the whole viewport: drop the card chrome and the 16:9 box,
+     which otherwise narrows the player in landscape fullscreen. */
+  .stage:fullscreen {
+    width: 100%;
+    height: 100%;
+    aspect-ratio: auto;
+    border: 0;
+    border-radius: 0;
+    box-shadow: none;
+  }
+  .stage:fullscreen .player-controls {
+    padding-right: max(24px, env(safe-area-inset-right));
+    padding-bottom: max(23px, env(safe-area-inset-bottom));
+    padding-left: max(24px, env(safe-area-inset-left));
   }
   video { width: 100%; height: 100%; display: block; background: #000; }
   .player-controls {
