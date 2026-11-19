@@ -536,11 +536,6 @@ impl<'a> RequestSpec<'a> {
         self
     }
 
-    fn with_properties(mut self) -> RequestSpec<'a> {
-        self.properties = true;
-        self
-    }
-
     fn header(mut self, key: &str, value: impl Into<String>) -> RequestSpec<'a> {
         self.headers.push((key.to_string(), value.into()));
         self
@@ -722,12 +717,20 @@ impl Client {
             .header("x-atv-did", self.device.identifier())
     }
 
-    fn epg_request(&self, start_millis: i64, end_millis: i64) -> reqwest::RequestBuilder {
+    /// `app/v2/content/channel/epg`: one channel's guide. The account-wide
+    /// `app/v3/content/epg` covers the OTT catalogue only, so linear channels
+    /// need this per-channel call.
+    fn channel_epg_request(
+        &self,
+        content_id: &str,
+        start_millis: i64,
+        end_millis: i64,
+    ) -> reqwest::RequestBuilder {
         self.request(
-            RequestSpec::get(&self.epg_base, "/app/v3/content/epg")
+            RequestSpec::get(&self.epg_base, "/app/v2/content/channel/epg")
+                .query("channelId", content_id)
                 .query("startTime", start_millis.to_string())
-                .query("endTime", end_millis.to_string())
-                .with_properties(),
+                .query("endTime", end_millis.to_string()),
         )
     }
 
@@ -959,32 +962,47 @@ impl Client {
             .collect())
     }
 
-    /// `app/v3/content/epg` for the whole entitled catalogue in one call.
-    pub async fn epg(
+    /// One linear channel's guide, for the catalogue built from
+    /// `livetv.airtel.tv`.
+    pub async fn channel_epg(
         &self,
         store: &crate::store::Store,
+        content_id: &str,
         start_millis: i64,
         end_millis: i64,
-    ) -> anyhow::Result<HashMap<String, Vec<AirtelProgram>>> {
+    ) -> anyhow::Result<Vec<AirtelProgram>> {
         let (mut status, mut bytes) = self
-            .send(self.epg_request(start_millis, end_millis), "epg")
+            .send(
+                self.channel_epg_request(content_id, start_millis, end_millis),
+                "epg",
+            )
             .await?;
         if self.refresh_after_unauthorized(status, store).await {
             (status, bytes) = self
-                .send(self.epg_request(start_millis, end_millis), "epg")
+                .send(
+                    self.channel_epg_request(content_id, start_millis, end_millis),
+                    "epg",
+                )
                 .await?;
         }
         let value: serde_json::Value = serde_json::from_slice(&bytes).unwrap_or_default();
-        #[derive(Deserialize, Default)]
-        struct EpgResponse {
-            #[serde(default, rename = "programGuide")]
-            program_guide: HashMap<String, Vec<AirtelProgram>>,
-        }
         if !(200..300).contains(&status) {
-            anyhow::bail!("airtel: EPG failed: {}", upstream_error(status, &value));
+            anyhow::bail!(
+                "airtel: channel guide failed: {}",
+                upstream_error(status, &value)
+            );
         }
-        let parsed: EpgResponse = serde_json::from_value(value).unwrap_or_default();
-        Ok(parsed.program_guide)
+        let mut guide: HashMap<String, Vec<AirtelProgram>> = serde_json::from_value(
+            value
+                .get("programGuide")
+                .cloned()
+                .unwrap_or(serde_json::Value::Null),
+        )
+        .unwrap_or_default();
+        Ok(guide
+            .remove(content_id)
+            .or_else(|| guide.into_values().next())
+            .unwrap_or_default())
     }
 
     /// `v3/user/content/playback` is the route the current clients use; it
@@ -1612,13 +1630,13 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn epg_parses_the_program_guide_map() {
+    async fn channel_epg_parses_the_program_guide_map() {
         let server = MockServer::start().await;
         Mock::given(method("GET"))
-            .and(path("/app/v3/content/epg"))
-            .and(query_param("startTime", "1700000000000"))
+            .and(path("/app/v2/content/channel/epg"))
+            .and(query_param("channelId", "1001"))
             .respond_with(ResponseTemplate::new(200).set_body_raw(
-                r#"{"programGuide":{"1001":[{"channelId":"1001","contentId":"p1","title":"Show","subtitle":"Episode 1","startTime":1700000000000,"endTime":1700003600000}]}}"#,
+                r#"{"programGuide":{"1001":[{"channelId":"1001","title":"Show","subtitle":"Episode 1","startTime":1700000000000,"endTime":1700003600000}]}}"#,
                 "application/json",
             ))
             .mount(&server)
@@ -1631,11 +1649,10 @@ mod tests {
         });
         let dir = tempfile::tempdir().unwrap();
         let store = crate::store::Store::open(dir.path().to_str().unwrap()).unwrap();
-        let guide = client
-            .epg(&store, 1_700_000_000_000, 1_700_003_600_000)
+        let programs = client
+            .channel_epg(&store, "1001", 1_700_000_000_000, 1_700_003_600_000)
             .await
             .unwrap();
-        let programs = guide.get("1001").unwrap();
         assert_eq!(programs.len(), 1);
         assert_eq!(programs[0].title, "Show");
         assert_eq!(programs[0].start_millis(), 1_700_000_000_000);

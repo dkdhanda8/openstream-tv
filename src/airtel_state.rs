@@ -471,14 +471,16 @@ impl AirtelState {
             .as_millis() as i64;
         let start = now.saturating_sub(EPG_PAST.as_millis() as i64);
         let end = now.saturating_add(EPG_WINDOW.as_millis() as i64);
-        let guide = client.epg(store, start, end).await?;
         let mut sources = Vec::new();
         let mut programmes = Vec::new();
         for channel in &channels {
             let id = channel_id(&channel.id);
             sources.push((id.clone(), channel.title.clone()));
-            if let Some(programs) = guide.get(&channel.id) {
-                for program in programs {
+            let Ok(programs) = client.channel_epg(store, &channel.id, start, end).await else {
+                continue;
+            };
+            {
+                for program in &programs {
                     programmes.push(crate::epg::XmlProgramme {
                         channel: id.clone(),
                         start: crate::epg::format_xmltv_time(program.start_millis()),
@@ -515,8 +517,7 @@ impl AirtelState {
         let start = (local - local.rem_euclid(day) - crate::epg::IST_OFFSET_MS)
             .saturating_add(offset_days.max(0).saturating_mul(day));
         let end = start.saturating_add(day);
-        let guide = client.epg(store, start, end).await?;
-        Ok(guide.get(content_id).cloned().unwrap_or_default())
+        client.channel_epg(store, content_id, start, end).await
     }
 
     pub fn account_fingerprint(&self) -> String {
@@ -757,7 +758,8 @@ mod tests {
     async fn web_epg_saturates_an_extreme_day_offset() {
         let server = MockServer::start().await;
         Mock::given(method("GET"))
-            .and(path("/app/v3/content/epg"))
+            .and(path("/app/v2/content/channel/epg"))
+            .and(query_param("channelId", "1001"))
             .respond_with(
                 ResponseTemplate::new(200)
                     .set_body_raw(r#"{"programGuide":{"1001":[]}}"#, "application/json"),
