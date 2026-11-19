@@ -150,3 +150,52 @@ contract, is retired on the live service (bare 404), and the surviving
 (`ATV400`). Resolving it needs a capture of a current client's play request or
 a newer APK than 1.124.6.
 
+## 10. STB client and the IPTV playback contract (2026-11-20)
+
+Evidence from the Airtel Xstream STB firmware for `UIW4078ATL` (Amlogic,
+Android TV 14, build `14.46.046-251113`, signed A/B OTA). The image carries the
+operator agent `product/priv-app/ICX` (`com.airtel.tv`, OTA/provisioning,
+`wss://icxdc.airtelxstreamota.com:6500/api/v2/device`,
+`content://com.airtel.tv.provider/customer`) and the client itself in
+`system/priv-app/TvLauncher` — the only APK that references `play.airtel.tv`,
+`x-atv-stkn`, `generateOtp` and `LIVETVCHANNEL`.
+
+Environment block embedded in `TvLauncher` (production):
+
+| Key | Value |
+|---|---|
+| `playbackhost` | `https://play.airtel.tv` |
+| `iptvLinearPlayApiUrl` | `https://iptv-playback.airtel.tv/` |
+| `linearHeartBeatApiUrl` | `http://iptvhb.airtel.com/` |
+| `livetv` | `https://livetv.airtel.tv` |
+| `livesmshost` | `https://sms-xstream.airtel.tv` |
+| `masterIQApiUrl` / `playIQApiUrl` | `https://user.iqvideo.in` / `https://play.iqvideo.in/` |
+
+Routes built by `data/repo/PlayerRepository`:
+
+| Purpose | Request |
+|---|---|
+| VOD playback | `play.airtel.tv` + `v5/user/playback` |
+| Linear (IPTV) playback | `iptv-playback.airtel.tv` + `playback/v2/info` |
+| Linear heartbeat | `iptvhb.airtel.com` + `v1/network/validation` |
+| Box identity | `v1/box/detail?chipId=&bsn=` with `x-box-auth-key`, `x-box-auth-value` |
+| Device registration | `v2/user/profile/deviceData`, `v1/device/activate` |
+
+`PlayerMiddlewareApi.linearStreamingCallback` (GET) sends `x-org-id`,
+`x-app-id`, `x-os-id`, `x-version-id`, `x-atv-did`, `x-atv-chip-id`,
+`x-atv-bsn`, `x-atv-dth-subscriber-id`, `x-group-name` with query `contentId`,
+`sh`, `resolution`, `cdnId`.
+
+Probed with a valid phone session: `GET /playback/v2/info` → `401 ATV013
+"Request not authenticated"`, with and without empty box headers. The chip id,
+box serial and `x-box-auth-*` values are provisioned to the physical box, so
+linear/DTH playback is bound to STB identity and cannot be produced from an OTT
+or phone session. Box identity also feeds `x-atv-dth-subscriber-id` in the
+JWT-less DTH flow.
+
+Consequence for this provider: the OTT catalogue (account-entitled,
+`app/v3/content/channels`) is the only playable surface reachable without STB
+credentials; the 783-channel linear catalogue on `livetv.airtel.tv` is
+enumerable and its EPG is public, but its playback requires the box.
+
+
