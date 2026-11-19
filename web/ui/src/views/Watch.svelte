@@ -3,7 +3,15 @@
   import { fade } from "svelte/transition";
   import { api, loadChannels, formatTime } from "../lib/api.js";
   import { recordWatch } from "../lib/history.js";
-  import { lockLandscape, shouldKeepControlsVisible, unlockOrientation } from "../lib/fullscreen.js";
+  import {
+    exitElementFullscreen,
+    fullscreenElement,
+    lockLandscape,
+    requestElementFullscreen,
+    shouldKeepControlsVisible,
+    supportsElementFullscreen,
+    unlockOrientation,
+  } from "../lib/fullscreen.js";
   import {
     createShakaPlayer,
     loadLiveSource,
@@ -187,8 +195,8 @@
   async function toggleFullscreen() {
     markActivity();
     try {
-      if (document.fullscreenElement) {
-        await document.exitFullscreen?.();
+      if (fullscreenElement()) {
+        await exitElementFullscreen();
         unlockOrientation();
         return;
       }
@@ -200,9 +208,9 @@
       // touch browsers only rotate when we lock the page to landscape after
       // the request is granted. iOS has no orientation lock, so native video
       // fullscreen stays the fallback there.
-      if (playerContainer?.requestFullscreen) {
+      if (supportsElementFullscreen(playerContainer)) {
         try {
-          await playerContainer.requestFullscreen();
+          await requestElementFullscreen(playerContainer);
           await lockLandscape();
           return;
         } catch {}
@@ -510,19 +518,21 @@
     // Browser UI and the system back gesture can leave fullscreen without
     // going through toggleFullscreen, so release the orientation lock here.
     const onFullscreenChange = () => {
-      if (document.fullscreenElement) return;
+      if (fullscreenElement()) return;
       unlockOrientation();
       markActivity();
     };
     window.addEventListener("offline", onOffline);
     window.addEventListener("online", onOnline);
     document.addEventListener("fullscreenchange", onFullscreenChange);
+    document.addEventListener("webkitfullscreenchange", onFullscreenChange);
     markActivity();
     return () => {
       clearInterval(clockTimer);
       window.removeEventListener("offline", onOffline);
       window.removeEventListener("online", onOnline);
       document.removeEventListener("fullscreenchange", onFullscreenChange);
+      document.removeEventListener("webkitfullscreenchange", onFullscreenChange);
     };
   });
 

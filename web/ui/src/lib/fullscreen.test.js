@@ -1,7 +1,7 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 
-import { lockLandscape, shouldKeepControlsVisible, unlockOrientation } from "./fullscreen.js";
+import { exitElementFullscreen, fullscreenElement, lockLandscape, requestElementFullscreen, shouldKeepControlsVisible, supportsElementFullscreen, unlockOrientation } from "./fullscreen.js";
 
 function touchMedia(coarse = true) {
   return (query) => ({ matches: coarse && query.includes("pointer: coarse") });
@@ -52,4 +52,32 @@ test("unlocking ignores browsers without the API", () => {
   unlockOrientation(undefined);
   unlockOrientation({ unlock: () => { throw new Error("denied"); } });
   assert.deepEqual(calls, ["unlock"]);
+});
+
+test("element fullscreen prefers the standard API and falls back to WebKit", async () => {
+  const standard = { requestFullscreen: async () => "standard" };
+  assert.equal(supportsElementFullscreen(standard), true);
+  assert.equal(await requestElementFullscreen(standard), "standard");
+
+  const calls = [];
+  const prefixed = { webkitRequestFullscreen: () => calls.push("enter") };
+  assert.equal(supportsElementFullscreen(prefixed), true);
+  await requestElementFullscreen(prefixed);
+  assert.deepEqual(calls, ["enter"]);
+});
+
+test("element fullscreen reports unsupported containers", async () => {
+  assert.equal(supportsElementFullscreen(null), false);
+  assert.equal(await requestElementFullscreen({}), null);
+  assert.equal(await exitElementFullscreen({}), null);
+});
+
+test("fullscreen element and exit use the WebKit fallback", async () => {
+  const target = { id: "stage" };
+  assert.equal(fullscreenElement({ webkitFullscreenElement: target }), target);
+  assert.equal(fullscreenElement({}), null);
+
+  const calls = [];
+  await exitElementFullscreen({ webkitExitFullscreen: () => calls.push("exit") });
+  assert.deepEqual(calls, ["exit"]);
 });

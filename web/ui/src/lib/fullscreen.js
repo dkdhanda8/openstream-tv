@@ -2,6 +2,34 @@
 // control overlay in charge, but mobile browsers leave the page in portrait
 // unless it asks for a landscape lock once the request is granted.
 
+// iPad Safari below 16.4 only offers the WebKit-prefixed fullscreen API, and
+// the event names differ there, so every access goes through these helpers.
+export function fullscreenElement(doc = globalThis.document) {
+  return doc?.fullscreenElement ?? doc?.webkitFullscreenElement ?? null;
+}
+
+export function supportsElementFullscreen(element) {
+  return typeof element?.requestFullscreen === "function" || typeof element?.webkitRequestFullscreen === "function";
+}
+
+export function requestElementFullscreen(element) {
+  if (typeof element?.requestFullscreen === "function") return element.requestFullscreen();
+  if (typeof element?.webkitRequestFullscreen === "function") {
+    element.webkitRequestFullscreen();
+    return Promise.resolve();
+  }
+  return null;
+}
+
+export function exitElementFullscreen(doc = globalThis.document) {
+  if (typeof doc?.exitFullscreen === "function") return doc.exitFullscreen();
+  if (typeof doc?.webkitExitFullscreen === "function") {
+    doc.webkitExitFullscreen();
+    return Promise.resolve();
+  }
+  return null;
+}
+
 // Tapping a control leaves it focused on touch devices. Only keyboard focus
 // should pin the overlay open; pointer focus must still fade after idle.
 export function shouldKeepControlsVisible(container, active = globalThis.document?.activeElement) {
