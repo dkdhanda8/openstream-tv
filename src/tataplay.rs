@@ -508,7 +508,7 @@ impl Client {
         let mut channels = Vec::new();
         loop {
             let page = self
-                .guide_page(day_start_ms, end, GUIDE_PAGE_SIZE, offset, false)
+                .guide_page(day_start_ms, end, GUIDE_PAGE_SIZE, offset, true)
                 .await?;
             if page.channels.is_empty() {
                 break;
@@ -668,7 +668,7 @@ impl Client {
         let mut offset = 0;
         loop {
             let page = self
-                .guide_page(today, end, CATALOGUE_PAGE_SIZE, offset, false)
+                .guide_page(today, end, CATALOGUE_PAGE_SIZE, offset, true)
                 .await?;
             if page.channels.is_empty() {
                 break;
