@@ -1106,7 +1106,7 @@ pub fn generate_m3u_playlist(
                 url.push_str(opts.quality);
             }
             let mut props = format!(
-                "#KODIPROP:inputstream=inputstream.adaptive\n#KODIPROP:inputstream.adaptive.manifest_type=mpd\n#KODIPROP:inputstream.adaptive.license_type=com.widevine.alpha\n#KODIPROP:inputstream.adaptive.license_key={}/live/key/{}",
+                "#KODIPROP:inputstream=inputstream.adaptive\n#KODIPROP:inputstream.adaptive.manifest_type=mpd\n#KODIPROP:inputstream.adaptive.license_type=com.widevine.alpha\n#KODIPROP:inputstream.adaptive.license_key={}/live/key/{}|R{{SSM}}|",
                 opts.host_url, ch.id
             );
             if !opts.quality.is_empty() {
@@ -1505,7 +1505,9 @@ mod tests {
         };
         let m3u = generate_m3u_playlist(&channels, &opts, |_| true, |_| false, |_| true);
         assert!(m3u.contains("http://h/live/mpd/999"));
-        assert!(m3u.contains("KODIPROP:inputstream.adaptive.license_key=http://h/live/key/999"));
+        assert!(m3u.contains(
+            "KODIPROP:inputstream.adaptive.license_key=http://h/live/key/999|R{SSM}|"
+        ));
     }
 
     #[test]
