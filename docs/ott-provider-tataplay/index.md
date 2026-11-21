@@ -97,6 +97,13 @@ LIT account. The details below replace the earlier runtime gaps:
 - **Media**: the decrypted manifest URL carries an Akamai `hdnea` token whose
   ACL covers the channel directory. Akamai accepts it as the `hdnea` cookie;
   the proxy sends both `hdnea` and the older `__hdnea__` name.
+- **License**: the Irdeto Widevine endpoint requires the playback JWT from
+  `data.tokenInfo.token` as `Authorization: Bearer <token>` on the license
+  request. Without it the same challenge is answered
+  `403 {"code":130001,"message":"License denied... [__anonymous]"}`. With it,
+  the license carries the key id that matches the manifest PSSH; a 2-byte dummy
+  challenge returns a license with a different key, which is why the token must
+  accompany the real 2.5–4 KB challenge.
 - **Per-channel detail**: `content-detail/pub/api/v1/lit/ls/channel/<id>`
   returns plain (unsigned) manifest/license URLs plus current, forward and
   backward programme rows. The unsigned URLs are not playable by themselves;

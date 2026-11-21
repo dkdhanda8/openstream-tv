@@ -611,7 +611,17 @@ impl TataplayState {
             return Vec::new();
         };
         match self.ensure_playback(document).await {
-            Some(resolved) => resolved.license_headers,
+            Some(mut resolved) => {
+                // Irdeto denies the Widevine challenge as `[__anonymous]`
+                // without the playback token from `tokenInfo`.
+                if !resolved.license_token.is_empty() {
+                    resolved.license_headers.push((
+                        "Authorization".to_string(),
+                        format!("Bearer {}", resolved.license_token),
+                    ));
+                }
+                resolved.license_headers
+            }
             None => Vec::new(),
         }
     }
@@ -714,6 +724,7 @@ mod tests {
             .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
                 "data": {
                     "sessionId": "sess-1",
+                    "tokenInfo": {"token": "playback-token", "expiresIn": 1795285971000i64},
                     "playbackUrls": {
                         "dashWidewinePlayUrl": "not-encrypted",
                         "dashWidewineLicenseUrl": "not-encrypted"
@@ -728,6 +739,14 @@ mod tests {
         assert_eq!(live.result, "OK");
         assert_eq!(live.mpd.auto, "not-encrypted");
         assert!(live.is_drm);
+        let headers = state.license_headers("tp_1918").await;
+        assert!(
+            headers
+                .iter()
+                .any(|(name, value)| name == "Authorization"
+                    && value == "Bearer playback-token"),
+            "the Irdeto challenge must carry the playback token: {headers:?}"
+        );
     }
 
     async fn wait_for(server: &MockServer, method: &str, path: &str) {

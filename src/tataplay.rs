@@ -708,11 +708,18 @@ impl Client {
             anyhow::bail!("tataplay: playback response has no DASH manifest URL");
         }
         let license_raw = first_field(&[playback, data], "dashWidewineLicenseUrl");
+        let license_token = data
+            .get("tokenInfo")
+            .and_then(|token| token.get("token"))
+            .and_then(Value::as_str)
+            .unwrap_or_default()
+            .to_string();
         Ok(ResolvedPlayback {
             playable: decrypt_url(&play_raw, keys)?,
             license_url: decrypt_url(&license_raw, keys)?,
             media_headers: Vec::new(),
             license_headers: Vec::new(),
+            license_token,
             session_id: first_field(&[data], "sessionId"),
             heartbeat_interval: data
                 .get("heartbeatInterval")
@@ -786,6 +793,9 @@ pub struct ResolvedPlayback {
     pub license_url: String,
     pub media_headers: Vec<(String, String)>,
     pub license_headers: Vec<(String, String)>,
+    /// Playback JWT from `tokenInfo`. Irdeto denies the Widevine challenge as
+    /// `[__anonymous]` unless it arrives as `Authorization: Bearer <token>`.
+    pub license_token: String,
     /// Concurrency session the upstream opened for this playback. It is also
     /// the `x-session-id` of the heartbeat calls.
     pub session_id: String,

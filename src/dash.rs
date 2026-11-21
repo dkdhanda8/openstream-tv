@@ -343,6 +343,7 @@ async fn live_mpd_inner(
     prefix: Option<axum::Extension<crate::api::KeyPrefix>>,
 ) -> Response {
     let quality = q.q.unwrap_or_else(|| "auto".to_string());
+    tracing::debug!(channel = %channel_id, quality = %quality, "live mpd request");
 
     if !state.channel_allowed(&channel_id).await {
         return (
@@ -385,6 +386,30 @@ pub async fn live_key_handler(
     body: Bytes,
 ) -> Response {
     let quality = q.q.unwrap_or_else(|| "auto".to_string());
+    let cookie_names = headers
+        .get(header::COOKIE)
+        .and_then(|value| value.to_str().ok())
+        .map(|value| {
+            value
+                .split(';')
+                .filter_map(|part| part.split('=').next())
+                .map(str::trim)
+                .collect::<Vec<_>>()
+                .join(",")
+        })
+        .unwrap_or_default();
+    tracing::debug!(
+        channel = %channel_id,
+        %method,
+        challenge_bytes = body.len(),
+        authorization = headers.contains_key(header::AUTHORIZATION),
+        cookies = %cookie_names,
+        user_agent = headers
+            .get(header::USER_AGENT)
+            .and_then(|value| value.to_str().ok())
+            .unwrap_or(""),
+        "live license request"
+    );
     if !state.channel_allowed(&channel_id).await {
         return (
             StatusCode::NOT_FOUND,
@@ -487,6 +512,7 @@ async fn drm_license_impl(
     // identity that authorised the playback session.
     #[cfg(feature = "beta")]
     if crate::tataplay::is_tataplay_channel(&channel_id) {
+        tracing::debug!(channel = %channel_id, url = %decoded_url, "tataplay license upstream");
         let mut req = state
             .http
             .request(method, &decoded_url)
@@ -635,19 +661,35 @@ async fn send_airtel_license_request(
 }
 
 async fn send_license_request(req: reqwest::RequestBuilder, body: Bytes) -> Response {
+    tracing::debug!(challenge_bytes = body.len(), "license request");
     match req.body(body).send().await {
         Ok(resp) => {
             let status =
                 StatusCode::from_u16(resp.status().as_u16()).unwrap_or(StatusCode::BAD_GATEWAY);
             let ct = resp.headers().get(header::CONTENT_TYPE).cloned();
             let bytes = resp.bytes().await.unwrap_or_default();
+            tracing::debug!(
+                status = status.as_u16(),
+                license_bytes = bytes.len(),
+                content_type = ct.as_ref()
+                    .and_then(|value| value.to_str().ok())
+                    .unwrap_or(""),
+                "license response"
+            );
+            if !status.is_success() {
+                let preview = String::from_utf8_lossy(&bytes[..bytes.len().min(300)]);
+                tracing::debug!(status = status.as_u16(), body = %preview, "license upstream rejected");
+            }
             let mut builder = Response::builder().status(status);
             if let Some(ct) = ct {
                 builder = builder.header(header::CONTENT_TYPE, ct);
             }
             builder.body(Body::from(bytes)).unwrap()
         }
-        Err(_) => (StatusCode::BAD_GATEWAY, "license upstream request failed").into_response(),
+        Err(error) => {
+            tracing::debug!(%error, "license upstream request failed");
+            (StatusCode::BAD_GATEWAY, "license upstream request failed").into_response()
+        }
     }
 }
 
@@ -690,6 +732,7 @@ async fn render_mpd_inner(state: Arc<AppState>, q: RenderMpdQuery) -> Response {
     let Some(channel_id) = q.channel_id.as_deref().filter(|id| !id.is_empty()) else {
         return (StatusCode::BAD_REQUEST, "channel_id is required").into_response();
     };
+    tracing::debug!(channel = %channel_id, "render mpd request");
     let mut decrypted = match decrypt_dash_route_value(&state.secure, channel_id, &q.auth) {
         Some(u) => u,
         None => return (StatusCode::BAD_REQUEST, "invalid auth parameter").into_response(),
