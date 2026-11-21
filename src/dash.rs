@@ -245,6 +245,17 @@ pub(crate) async fn get_live_cached(
     state: &AppState,
     channel_id: &str,
 ) -> anyhow::Result<(LiveUrlOutput, u64)> {
+    get_live_cached_selected(state, channel_id, None).await
+}
+
+/// `get_live_cached` for a caller that already registered a Tata Play
+/// selection; a cache miss resolves only while that selection still owns the
+/// channel.
+pub(crate) async fn get_live_cached_selected(
+    state: &AppState,
+    channel_id: &str,
+    selected: Option<&str>,
+) -> anyhow::Result<(LiveUrlOutput, u64)> {
     let epoch = state.secure.current_epoch();
     if let Some(cached) = state.dash_state.get_live(channel_id, epoch) {
         return Ok((cached, epoch));
@@ -257,7 +268,7 @@ pub(crate) async fn get_live_cached(
         if let Some(cached) = state.dash_state.get_live(channel_id, epoch) {
             return Ok((cached, epoch));
         }
-        let live = crate::stream::fetch_live(state, channel_id).await?;
+        let live = crate::stream::fetch_live_selected(state, channel_id, selected).await?;
         if state
             .dash_state
             .set_live(channel_id, live.clone(), epoch, || {
@@ -588,14 +599,21 @@ async fn drm_license_impl(
     // by the time the player sends its challenge.
     #[cfg(feature = "beta")]
     if crate::tataplay::is_tataplay_channel(&channel_id) {
-        if let Some(pid) = params
-            .get("pid")
-            .and_then(|enc| decrypt_dash_route_value(&state.secure, &channel_id, enc))
-        {
+        // An absent route id is the legacy shape and stays accepted. A route
+        // id that is present but cannot be decrypted belongs to an older
+        // account context; treating it as absent would let a stale challenge
+        // ride the current session's token.
+        let mut playback_id = None;
+        if let Some(enc) = params.get("pid") {
+            let Some(pid) = decrypt_dash_route_value(&state.secure, &channel_id, enc) else {
+                tracing::debug!(channel = %channel_id, "invalid tataplay playback id");
+                return (StatusCode::CONFLICT, "stale playback").into_response();
+            };
             if !state.tataplay.playback_matches(&channel_id, &pid) {
                 tracing::debug!(channel = %channel_id, "stale tataplay license request");
                 return (StatusCode::CONFLICT, "stale playback").into_response();
             }
+            playback_id = Some(pid);
         }
         let session = match state.tataplay.license_session(&channel_id).await {
             Ok(session) => session,
@@ -648,7 +666,7 @@ async fn drm_license_impl(
             // session and retry that challenge once.
             if let Ok(fresh) = state
                 .tataplay
-                .refresh_license(&channel_id, &session.session_id)
+                .refresh_license(&channel_id, &session.session_id, playback_id.as_deref())
                 .await
             {
                 tracing::debug!(
@@ -1481,11 +1499,10 @@ async fn render_mpd_inner(state: Arc<AppState>, q: RenderMpdQuery) -> Response {
     {
         let tata = crate::tataplay::is_tataplay_channel(channel_id);
         if tata {
-            if let Some(pid) = q
-                .pid
-                .as_deref()
-                .and_then(|enc| decrypt_dash_route_value(&state.secure, channel_id, enc))
-            {
+            if let Some(enc) = q.pid.as_deref() {
+                let Some(pid) = decrypt_dash_route_value(&state.secure, channel_id, enc) else {
+                    return (StatusCode::CONFLICT, "stale playback").into_response();
+                };
                 if !state.tataplay.playback_matches(channel_id, &pid) {
                     return (StatusCode::CONFLICT, "stale playback").into_response();
                 }
@@ -2594,6 +2611,53 @@ mod tests {
 
         assert_eq!(response.status(), StatusCode::CONFLICT);
         server.verify().await;
+    }
+
+    /// A `pid` that is present but cannot be decrypted belongs to an older
+    /// account context. Treating it as absent would pair an old challenge with
+    /// the current session's token.
+    #[cfg(feature = "beta")]
+    #[tokio::test]
+    async fn tataplay_license_rejects_an_undecryptable_playback_id() {
+        let state = license_test_state(Arc::new(crate::playbox_state::PlayboxState::new(false)));
+        let params = std::collections::HashMap::from([
+            (
+                "auth".to_string(),
+                encrypt_dash_route_value(&state.secure, "tp_1918", "http://license.test/x"),
+            ),
+            ("channel_id".to_string(), "tp_1918".to_string()),
+            ("pid".to_string(), "not-a-route-value".to_string()),
+        ]);
+        let response = drm_license_handler(
+            State(state),
+            Query(params),
+            Method::POST,
+            axum::http::HeaderMap::new(),
+            Bytes::from_static(b"widevine-challenge"),
+        )
+        .await;
+
+        assert_eq!(response.status(), StatusCode::CONFLICT);
+        let body = axum::body::to_bytes(response.into_body(), 1024)
+            .await
+            .unwrap();
+        assert_eq!(&body[..], b"stale playback");
+    }
+
+    /// The manifest route applies the same rule as the license route.
+    #[cfg(feature = "beta")]
+    #[tokio::test]
+    async fn tataplay_manifest_rejects_an_undecryptable_playback_id() {
+        let state = license_test_state(Arc::new(crate::playbox_state::PlayboxState::new(false)));
+        let q = RenderMpdQuery {
+            auth: encrypt_dash_route_value(&state.secure, "tp_1918", "http://origin.test/x.mpd"),
+            channel_id: Some("tp_1918".to_string()),
+            q: None,
+            hdnea: None,
+            pid: Some("not-a-route-value".to_string()),
+        };
+        let response = render_mpd_inner(state, q).await;
+        assert_eq!(response.status(), StatusCode::CONFLICT);
     }
 
     fn drm_output() -> DrmMpdOutput {

@@ -539,6 +539,9 @@ impl TataplayState {
     pub fn tune(&self, channel_id: &str) -> Option<String> {
         let document = document_id(channel_id)?;
         let playback_id = Self::new_playback_id();
+        // Serialized with license publication so a session can never be
+        // installed after this selection replaced its intent.
+        let _guard = self.commit.lock().unwrap();
         *self.intent.lock().unwrap() = Some(PlaybackIntent {
             document: document.to_string(),
             playback_id: playback_id.clone(),
@@ -563,6 +566,25 @@ impl TataplayState {
         self.tune(channel_id)
     }
 
+    /// A selection outside Tata Play (for example a custom channel) makes any
+    /// pending Tata Play resolve stale before it can start a session, and
+    /// releases the account's single slot instead of leaving it to expire.
+    pub fn cancel_tune(&self) {
+        {
+            let _guard = self.commit.lock().unwrap();
+            *self.intent.lock().unwrap() = None;
+        }
+        self.stop_heartbeat();
+    }
+
+    /// Whether a resolved request still matches the user's current selection.
+    pub fn selection_matches(&self, channel_id: &str, playback_id: &str) -> bool {
+        document_id(channel_id).is_some_and(|document| {
+            self.intent_for(document)
+                .is_some_and(|intent| intent.playback_id == playback_id)
+        })
+    }
+
     fn intent_for(&self, document: &str) -> Option<PlaybackIntent> {
         self.intent
             .lock()
@@ -575,6 +597,7 @@ impl TataplayState {
     /// The intent for a tune, creating one when the caller did not go through
     /// [`Self::tune`] (tests and direct provider use).
     fn begin_tune(&self, document: &str) -> PlaybackIntent {
+        let _guard = self.commit.lock().unwrap();
         let mut intent = self.intent.lock().unwrap();
         if let Some(current) = intent.as_ref() {
             if current.document == document {
@@ -626,8 +649,26 @@ impl TataplayState {
         &self,
         document: &str,
         mode: PlaybackMode,
+        selected: Option<&str>,
     ) -> Option<ResolvedPlayback> {
         *self.last_activity.lock().unwrap() = Instant::now();
+        // A tune must keep the intent it entered with. Creating it only after
+        // the mutex would let a queued request replace a newer selection.
+        // A request that came through `/api/live/play` carries the id it
+        // selected; when a custom channel has since replaced it, that request
+        // must stop here instead of starting a session for a channel the user
+        // already left.
+        let tune_intent = match (mode, selected) {
+            (PlaybackMode::Tune, Some(selected)) => {
+                let intent = self.intent_for(document)?;
+                if intent.playback_id != selected {
+                    return None;
+                }
+                Some(intent)
+            }
+            (PlaybackMode::Tune, None) => Some(self.begin_tune(document)),
+            (PlaybackMode::Refresh, _) => None,
+        };
         if mode == PlaybackMode::Refresh {
             self.intent_for(document)?;
             if let Some(active) = self.active_document() {
@@ -640,12 +681,16 @@ impl TataplayState {
         if let Some((resolved, at)) = cached {
             if at.elapsed() < PLAYBACK_TTL && self.session_is_active(document, &resolved) {
                 let mut resolved = resolved;
-                if mode == PlaybackMode::Tune {
-                    let intent = self.begin_tune(document);
+                if let Some(intent) = &tune_intent {
+                    if self.intent_for(document).map(|i| i.playback_id)
+                        != Some(intent.playback_id.clone())
+                    {
+                        return None;
+                    }
                     if resolved.playback_id != intent.playback_id {
                         resolved.playback_id = intent.playback_id.clone();
                         if let Some((entry, _)) = self.resolved.write().unwrap().get_mut(document) {
-                            entry.playback_id = intent.playback_id;
+                            entry.playback_id = intent.playback_id.clone();
                         }
                     }
                 }
@@ -667,12 +712,16 @@ impl TataplayState {
         if let Some((resolved, at)) = cached {
             if at.elapsed() < PLAYBACK_TTL && self.session_is_active(document, &resolved) {
                 let mut resolved = resolved;
-                if mode == PlaybackMode::Tune {
-                    let intent = self.begin_tune(document);
+                if let Some(intent) = &tune_intent {
+                    if self.intent_for(document).map(|i| i.playback_id)
+                        != Some(intent.playback_id.clone())
+                    {
+                        return None;
+                    }
                     if resolved.playback_id != intent.playback_id {
                         resolved.playback_id = intent.playback_id.clone();
                         if let Some((entry, _)) = self.resolved.write().unwrap().get_mut(document) {
-                            entry.playback_id = intent.playback_id;
+                            entry.playback_id = intent.playback_id.clone();
                         }
                     }
                 }
@@ -680,13 +729,18 @@ impl TataplayState {
             }
         }
         let intent = match mode {
-            PlaybackMode::Tune => self.begin_tune(document),
+            PlaybackMode::Tune => tune_intent?,
             PlaybackMode::Refresh => match self.intent_for(document) {
                 Some(intent) => intent,
                 // A tune for another channel landed while this refresh waited.
                 None => return None,
             },
         };
+        // A queued tune keeps its original identity even if another selection
+        // arrived while it waited for the mutex.
+        if self.intent_for(document).map(|i| i.playback_id) != Some(intent.playback_id.clone()) {
+            return None;
+        }
         if mode == PlaybackMode::Refresh {
             if let Some(active) = self.active_document() {
                 if active != document {
@@ -848,11 +902,22 @@ impl TataplayState {
 
     /// Resolves a `tp_` channel to the shared playback shape.
     pub async fn live(&self, channel_id: &str) -> anyhow::Result<LiveUrlOutput> {
+        self.live_selected(channel_id, None).await
+    }
+
+    /// Resolves a channel only while `selected` is still the user's choice.
+    /// `/api/live/play` passes the id it registered, so a request that a
+    /// custom-channel selection superseded cannot open a session.
+    pub async fn live_selected(
+        &self,
+        channel_id: &str,
+        selected: Option<&str>,
+    ) -> anyhow::Result<LiveUrlOutput> {
         let document = document_id(channel_id)
             .ok_or_else(|| anyhow::anyhow!("tataplay: not a tataplay channel"))?;
         self.ensure_catalogue().await;
         let resolved = self
-            .ensure_playback(document, PlaybackMode::Tune)
+            .ensure_playback(document, PlaybackMode::Tune, selected)
             .await
             .ok_or_else(|| anyhow::anyhow!("tataplay: playback could not be resolved"))?;
         Ok(self.live_output(&resolved))
@@ -866,7 +931,7 @@ impl TataplayState {
             .ok_or_else(|| anyhow::anyhow!("tataplay: not a tataplay channel"))?;
         self.ensure_catalogue().await;
         let resolved = self
-            .ensure_playback(document, PlaybackMode::Refresh)
+            .ensure_playback(document, PlaybackMode::Refresh, None)
             .await
             .ok_or_else(|| anyhow::anyhow!("tataplay: playback could not be refreshed"))?;
         Ok(self.live_output(&resolved))
@@ -893,7 +958,10 @@ impl TataplayState {
         let Some(document) = document_id(channel_id) else {
             return Vec::new();
         };
-        match self.ensure_playback(document, PlaybackMode::Refresh).await {
+        match self
+            .ensure_playback(document, PlaybackMode::Refresh, None)
+            .await
+        {
             Some(resolved) => resolved.media_headers,
             None => Vec::new(),
         }
@@ -914,6 +982,7 @@ impl TataplayState {
         &self,
         channel_id: &str,
         stale_session_id: &str,
+        expected_playback_id: Option<&str>,
     ) -> anyhow::Result<LicenseSession> {
         let document = document_id(channel_id)
             .ok_or_else(|| anyhow::anyhow!("tataplay: not a tataplay channel"))?;
@@ -921,6 +990,11 @@ impl TataplayState {
 
         if let Some((resolved, _)) = self.resolved.read().unwrap().get(document) {
             if !resolved.session_id.is_empty() && resolved.session_id != stale_session_id {
+                // A replacement tune owns this channel now. Do not hand its
+                // token to the old challenge.
+                if expected_playback_id.is_some_and(|expected| expected != resolved.playback_id) {
+                    anyhow::bail!("tataplay: playback changed during the license refresh");
+                }
                 return LicenseSession::from_playback(resolved)
                     .ok_or_else(|| anyhow::anyhow!("tataplay: playback carries no license URL"));
             }
@@ -929,13 +1003,16 @@ impl TataplayState {
         // A late retry for a channel that no longer owns the account's single
         // slot must not close the session the account is using now.
         let _tune = self.tune.lock().await;
-        if self.intent_for(document).is_none() {
+        let Some(intent) = self.intent_for(document) else {
             anyhow::bail!("tataplay: channel {channel_id} is no longer the intended playback");
-        }
+        };
         if let Some(active) = self.active_document() {
             if active != document {
                 anyhow::bail!("tataplay: channel {channel_id} is not the active playback");
             }
+        }
+        if expected_playback_id.is_some_and(|expected| expected != intent.playback_id) {
+            anyhow::bail!("tataplay: playback changed during the license refresh");
         }
         let playback_id = self
             .resolved
@@ -944,8 +1021,7 @@ impl TataplayState {
             .get(document)
             .map(|(resolved, _)| resolved.playback_id.clone())
             .filter(|id| !id.is_empty())
-            .or_else(|| self.intent_for(document).map(|intent| intent.playback_id))
-            .unwrap_or_default();
+            .unwrap_or_else(|| intent.playback_id.clone());
         let generation = self.generation();
 
         let client = self
@@ -987,17 +1063,29 @@ impl TataplayState {
             last_error
                 .unwrap_or_else(|| anyhow::anyhow!("tataplay: playback could not be resolved"))
         })?;
-        resolved.playback_id = playback_id;
+        resolved.playback_id = playback_id.clone();
         let committed = self.commit_if_current(generation, || {
+            // Atomic with `tune`: a selection that replaced this playback id
+            // while `client.play` waited must win, even though the account
+            // generation is unchanged.
+            if self.intent_for(document).map(|current| current.playback_id)
+                != Some(playback_id.clone())
+            {
+                return false;
+            }
             self.resolved
                 .write()
                 .unwrap()
                 .insert(document.to_string(), (resolved.clone(), Instant::now()));
             self.start_heartbeat(&client, document, &resolved);
+            true
         });
-        if committed.is_none() {
+        if committed != Some(true) {
             if let Err(error) = client.end_session(&resolved.session_id).await {
                 tracing::debug!(%error, "tataplay stale refresh session end failed");
+            }
+            if committed == Some(false) {
+                anyhow::bail!("tataplay: playback changed during the license refresh");
             }
             anyhow::bail!("tataplay: account changed during the license refresh");
         }
@@ -1019,7 +1107,7 @@ impl TataplayState {
             }
         }
         let resolved = self
-            .ensure_playback(document, PlaybackMode::Refresh)
+            .ensure_playback(document, PlaybackMode::Refresh, None)
             .await
             .ok_or_else(|| anyhow::anyhow!("tataplay: playback could not be resolved"))?;
         LicenseSession::from_playback(&resolved)
@@ -1472,7 +1560,7 @@ mod tests {
             .any(|(name, value)| name == "Authorization" && value == "Bearer token-a"));
 
         let fresh = state
-            .refresh_license("tp_1918", &first.session_id)
+            .refresh_license("tp_1918", &first.session_id, None)
             .await
             .unwrap();
         assert_eq!(fresh.session_id, "sess-b");
@@ -1492,7 +1580,10 @@ mod tests {
 
         // A second, delayed 130601 retry that still names session A must reuse
         // B rather than closing it and opening another session.
-        let reused = state.refresh_license("tp_1918", "sess-a").await.unwrap();
+        let reused = state
+            .refresh_license("tp_1918", "sess-a", None)
+            .await
+            .unwrap();
         assert_eq!(reused.session_id, "sess-b");
         assert_eq!(reused.url, fresh.url);
         assert_eq!(plays.load(Ordering::SeqCst), 2);
@@ -1747,7 +1838,7 @@ mod tests {
 
         let first_session = state.license_session("tp_1918").await.unwrap();
         state
-            .refresh_license("tp_1918", &first_session.session_id)
+            .refresh_license("tp_1918", &first_session.session_id, Some(&tune))
             .await
             .unwrap();
 
@@ -1757,6 +1848,121 @@ mod tests {
             "a licence refresh must not rotate the route id"
         );
         assert_eq!(plays.load(Ordering::SeqCst), 2);
+    }
+
+    /// A refresh that lands after the user picked another channel must end the
+    /// session it just opened instead of publishing it for the old channel.
+    #[tokio::test]
+    async fn licence_refresh_rejects_a_superseded_tune() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/lit-ls-config/pub/api/v1/config"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "data": {"app": {"dd": {"v1": "ZG5INSxTMSVDbSN1cFclZQ==", "v2": "YWVzRW5jcnlwdGlvbktleQ=="}}}
+            })))
+            .mount(&server)
+            .await;
+        let plays = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let plays_for_response = plays.clone();
+        Mock::given(method("GET"))
+            .and(path("/pas/api/v1/access/control/LIVE/1918"))
+            .respond_with(move |_request: &wiremock::Request| {
+                let call = plays_for_response.fetch_add(1, Ordering::SeqCst);
+                let session = if call == 0 { "sess-a" } else { "sess-b" };
+                let mut response = ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                    "data": {
+                        "sessionId": session,
+                        "heartbeatInterval": 3600,
+                        "tokenInfo": {"token": format!("token-{session}")},
+                        "playbackUrls": {
+                            "dashWidewinePlayUrl": "not-encrypted",
+                            "dashWidewineLicenseUrl": "not-encrypted"
+                        }
+                    }
+                }));
+                if call > 0 {
+                    // Keep the refresh in flight while another tune lands.
+                    response = response.set_delay(Duration::from_millis(200));
+                }
+                response
+            })
+            .mount(&server)
+            .await;
+        Mock::given(method("POST"))
+            .and(path("/smgs/api/v1/session"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({"code": 0})))
+            .mount(&server)
+            .await;
+        Mock::given(method("DELETE"))
+            .and(path("/smgs/api/v1/session"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({"code": 0})))
+            .mount(&server)
+            .await;
+
+        let state = TataplayState::new(true);
+        state.set_client_for_test(client_for(&server));
+        state.live("tp_1918").await.unwrap();
+        let playback_id = state.current_playback_id("tp_1918").unwrap();
+        let first = state.license_session("tp_1918").await.unwrap();
+
+        let supersede = async {
+            tokio::time::sleep(Duration::from_millis(50)).await;
+            state.tune("tp_523");
+        };
+        let (refresh, ()) = tokio::join!(
+            state.refresh_license("tp_1918", &first.session_id, Some(&playback_id)),
+            supersede
+        );
+        let error = refresh.unwrap_err().to_string();
+        assert!(error.contains("playback changed"), "{error}");
+        assert_ne!(state.active_document().as_deref(), Some("1918"));
+        assert!(
+            state
+                .resolved
+                .read()
+                .unwrap()
+                .get("1918")
+                .is_some_and(|(resolved, _)| resolved.session_id == "sess-a"),
+            "the superseded session must not be published"
+        );
+        assert!(
+            server
+                .received_requests()
+                .await
+                .unwrap()
+                .iter()
+                .any(|request| request.method.as_str() == "DELETE"
+                    && request
+                        .headers
+                        .get("x-session-id")
+                        .is_some_and(|value| value == "sess-b")),
+            "the late session must be ended"
+        );
+    }
+
+    /// A request that was queued behind a custom-channel selection must not
+    /// open a session with a recreated intent.
+    #[tokio::test]
+    async fn cancel_tune_stops_a_queued_resolve_before_access_control() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/pas/api/v1/access/control/LIVE/1918"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({"data": {}})))
+            .expect(0)
+            .mount(&server)
+            .await;
+
+        let state = TataplayState::new(true);
+        state.set_client_for_test(client_for(&server));
+        let selected = state.tune("tp_1918").unwrap();
+        assert!(state.selection_matches("tp_1918", &selected));
+        state.cancel_tune();
+        assert!(!state.selection_matches("tp_1918", &selected));
+        assert!(state
+            .ensure_playback("1918", PlaybackMode::Tune, Some(&selected))
+            .await
+            .is_none());
+        server.verify().await;
     }
 
     /// A 130402 on a deliberate tune gives the provider a moment, but a
@@ -1837,7 +2043,7 @@ mod tests {
             "{error}"
         );
         let error = state
-            .refresh_license("tp_2", "sess-stale")
+            .refresh_license("tp_2", "sess-stale", None)
             .await
             .unwrap_err()
             .to_string();
