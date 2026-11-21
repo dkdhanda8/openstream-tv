@@ -126,7 +126,10 @@ guide serves `/epg/<id>/<offset>` from the same cached days.
 `NetworkApi.X` opens a concurrency session with a bodyless
 `POST smgs/api/v1/session`, carrying `x-device-name` and the `x-session-id`
 returned by access control. The provider registers that session as soon as
-playback resolves and repeats the call every `heartbeatInterval` seconds. It
+playback resolves and repeats the call every `heartbeatInterval` seconds.
+Because the account's concurrency slot is one, the previous channel's session
+is closed before the next access-control call; otherwise the upstream answers
+the new channel with HTTP 403. It
 sends the bodyless `DELETE smgs/api/v1/session` when playback is invalidated
 (a CDN rejection), when the provider is cleared on logout or account switch,
 when another channel replaces the session, and after five minutes without a

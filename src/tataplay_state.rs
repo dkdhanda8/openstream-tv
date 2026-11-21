@@ -431,6 +431,10 @@ impl TataplayState {
             tracing::warn!("tataplay: playback resolve has no decryption keys");
             return None;
         };
+        // The account's concurrency slot is one. Release the previous
+        // channel's session before asking access control for the next one,
+        // otherwise the upstream sees the old session and answers 403.
+        self.end_previous_session(document).await;
         let resolved = match client.play(document, &keys).await {
             Ok(resolved) => resolved,
             Err(error) => {
@@ -506,6 +510,25 @@ impl TataplayState {
             client: client.clone(),
             task,
         });
+    }
+
+    /// Closes the session owned by a different channel and waits for the
+    /// upstream DELETE, so the next access-control call sees a free slot.
+    async fn end_previous_session(&self, document: &str) {
+        let running = {
+            let mut slot = self.heartbeat.lock().unwrap();
+            match slot.as_ref() {
+                Some(running) if running.document != document => slot.take(),
+                _ => None,
+            }
+        };
+        let Some(running) = running else {
+            return;
+        };
+        running.task.abort();
+        if let Err(error) = running.client.end_session(&running.session_id).await {
+            tracing::debug!(%error, "tataplay replaced session end failed");
+        }
     }
 
     /// Stops the beat and closes the session, freeing the concurrency slot.
