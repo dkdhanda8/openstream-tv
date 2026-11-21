@@ -180,6 +180,13 @@ impl TataplayState {
         *self.client.write().unwrap() = Some(client);
     }
 
+    #[cfg(test)]
+    pub fn expire_catalogue_for_test(&self) {
+        *self.catalogue_fetched_at.write().unwrap() =
+            Some(Instant::now() - CATALOGUE_TTL - Duration::from_secs(1));
+        *self.catalogue_failed_at.write().unwrap() = None;
+    }
+
     fn generation(&self) -> u64 {
         self.generation.load(Ordering::SeqCst)
     }
@@ -317,7 +324,18 @@ impl TataplayState {
             Ok(channels) => {
                 let now = Instant::now();
                 self.commit_if_current(generation, || {
-                    *self.catalogue.write().unwrap() = channels;
+                    let mut catalogue = self.catalogue.write().unwrap();
+                    let changed = catalogue.len() != channels.len()
+                        || catalogue
+                            .iter()
+                            .zip(channels.iter())
+                            .any(|(old, new)| old.id != new.id);
+                    *catalogue = channels;
+                    if changed {
+                        // A pack change invalidates every cached guide day:
+                        // the new lineup can have different programme rows.
+                        self.epg_cache.write().unwrap().clear();
+                    }
                     *self.catalogue_fetched_at.write().unwrap() = Some(now);
                     *self.catalogue_failed_at.write().unwrap() = None;
                 })
@@ -436,6 +454,13 @@ impl TataplayState {
     ) -> anyhow::Result<Vec<GuideProgramme>> {
         let document = document_id(channel_id)
             .ok_or_else(|| anyhow::anyhow!("tataplay: not a tataplay channel"))?;
+        self.ensure_catalogue().await;
+        // A direct EPG link must respect the account's current lineup. A
+        // cached guide day may still contain a channel removed by a pack
+        // change; catalogue membership is the gate.
+        if !self.contains(channel_id) {
+            return Ok(Vec::new());
+        }
         let day = crate::tataplay::tataplay_day_start()
             .saturating_add(offset_days.clamp(0, 6).saturating_mul(86_400_000));
         let guide = self.epg_day(day).await?;
@@ -1029,6 +1054,24 @@ mod tests {
     use wiremock::matchers::{header, method, path, query_param};
     use wiremock::{Mock, MockServer, ResponseTemplate};
 
+    fn guide_row(id: u32, number: &str) -> serde_json::Value {
+        serde_json::json!({
+            "id": id,
+            "title": format!("Channel {id}"),
+            "channelNumber": number
+        })
+    }
+
+    fn guide_row_with_epg(id: u32, number: &str) -> serde_json::Value {
+        let mut row = guide_row(id, number);
+        row["epg"] = serde_json::json!([{
+            "startTime": 1795293000000i64,
+            "endTime": 1795296600000i64,
+            "title": "Test programme"
+        }]);
+        row
+    }
+
     fn client_for(server: &MockServer) -> Arc<Client> {
         Arc::new(Client::for_test(
             &server.uri(),
@@ -1042,32 +1085,21 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn catalogue_uses_the_guide_and_filters_by_pack_entitlement() {
+    async fn catalogue_uses_the_subscribed_guide_and_sorts_channels() {
         let server = MockServer::start().await;
         Mock::given(method("GET"))
             .and(path("/lit-mobile-common-bff/api/v2/channels/guide"))
             .and(header("sid", "sid-1"))
             .and(query_param("limit", "600"))
+            .and(query_param("subscribedFilter", "true"))
             .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
                 "data": {"total": 3, "channelList": [
                     {"id": 1918, "title": "Star Plus", "channelNumber": "115",
-                     "hdChannel": true, "entitlements": ["held"],
-                     "boxCoverImage": "a.png"},
-                    {"id": 1914, "title": "Zee TV", "channelNumber": "120",
-                     "entitlements": ["missing"]},
+                     "hdChannel": true, "boxCoverImage": "a.png"},
+                    {"id": 1914, "title": "Zee TV", "channelNumber": "120"},
                     {"id": 40, "title": "Sony SAB", "channelNumber": "121",
-                     "entitlements": ["held", "other"], "restartTv": true}
+                     "restartTv": true}
                 ]}
-            })))
-            .mount(&server)
-            .await;
-        Mock::given(method("GET"))
-            .and(path(
-                "/lit-subscription-service/api/v1/lit/getEntitlementDetails",
-            ))
-            .and(query_param("forceRefresh", "true"))
-            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
-                "data": {"entitlements": ["held"]}
             })))
             .mount(&server)
             .await;
@@ -1075,13 +1107,258 @@ mod tests {
         state.set_client_for_test(client_for(&server));
         assert!(state.ensure_catalogue().await);
         let channels = state.channels();
-        assert_eq!(channels.len(), 2);
+        // The guide's subscribed page is the lineup; there is no second pack
+        // filter to drop a row the provider returned.
+        assert_eq!(channels.len(), 3);
         assert!(state.contains(&channel_id("1918")));
-        assert!(!state.contains(&channel_id("1914")));
+        assert!(state.contains(&channel_id("1914")));
         assert!(state.contains("tp_40"));
         assert_eq!(channels[0].id, "tp_1918");
         assert_eq!(channels[0].logo_url, "a.png");
-        assert!(channels[1].is_catchup_available);
+        assert_eq!(channels[1].id, "tp_1914");
+        assert!(channels[2].is_catchup_available);
+    }
+
+    #[tokio::test]
+    async fn catalogue_change_clears_cached_guide_days() {
+        let server = MockServer::start().await;
+        let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let calls_for_response = calls.clone();
+        Mock::given(method("GET"))
+            .and(path("/lit-mobile-common-bff/api/v2/channels/guide"))
+            .and(query_param("limit", "600"))
+            .and(query_param("subscribedFilter", "true"))
+            .respond_with(move |_request: &wiremock::Request| {
+                let call = calls_for_response.fetch_add(1, Ordering::SeqCst);
+                let rows = match call {
+                    0 => vec![guide_row(1918, "115")],
+                    1 => vec![guide_row(1918, "115"), guide_row(1928, "116")],
+                    _ => vec![guide_row(1918, "115")],
+                };
+                let total = rows.len();
+                ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                    "data": {"total": total, "channelList": rows}
+                }))
+            })
+            .expect(3)
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/lit-mobile-common-bff/api/v2/channels/guide"))
+            .and(query_param("limit", "200"))
+            .and(query_param("subscribedFilter", "true"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "data": {"total": 1, "channelList": [guide_row_with_epg(1918, "115")]}
+            })))
+            .mount(&server)
+            .await;
+
+        let state = TataplayState::new(true);
+        state.set_client_for_test(client_for(&server));
+        assert!(state.ensure_catalogue().await);
+        assert!(state.contains("tp_1918"));
+        assert!(!state.contains("tp_1928"));
+        let today = crate::tataplay::tataplay_day_start();
+        assert!(!state.epg_day(today).await.unwrap().is_empty());
+        assert!(!state.epg_cache.read().unwrap().is_empty());
+
+        state.expire_catalogue_for_test();
+        assert!(state.ensure_catalogue().await);
+        assert!(
+            state.contains("tp_1928"),
+            "an added pack appears after refresh"
+        );
+        assert!(
+            state.epg_cache.read().unwrap().is_empty(),
+            "a changed lineup must not reuse the old guide day"
+        );
+
+        state.expire_catalogue_for_test();
+        assert!(state.ensure_catalogue().await);
+        assert!(
+            !state.contains("tp_1928"),
+            "a removed pack leaves the lineup"
+        );
+        assert!(state.epg_cache.read().unwrap().is_empty());
+        server.verify().await;
+    }
+
+    #[tokio::test]
+    async fn direct_web_epg_requires_catalogue_membership() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/lit-mobile-common-bff/api/v2/channels/guide"))
+            .and(query_param("limit", "600"))
+            .and(query_param("subscribedFilter", "true"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "data": {"total": 1, "channelList": [guide_row(1918, "115")]}
+            })))
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/lit-mobile-common-bff/api/v2/channels/guide"))
+            .and(query_param("limit", "200"))
+            .and(query_param("subscribedFilter", "true"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "data": {"total": 1, "channelList": [guide_row_with_epg(1918, "115")]}
+            })))
+            .mount(&server)
+            .await;
+
+        let state = TataplayState::new(true);
+        state.set_client_for_test(client_for(&server));
+        assert!(
+            state.web_epg("tp_1928", 0).await.unwrap().is_empty(),
+            "a direct link to a channel outside the lineup has no rows"
+        );
+        assert_eq!(state.web_epg("tp_1918", 0).await.unwrap().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn catalogue_failure_keeps_the_previous_lineup() {
+        let server = MockServer::start().await;
+        let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let calls_for_response = calls.clone();
+        Mock::given(method("GET"))
+            .and(path("/lit-mobile-common-bff/api/v2/channels/guide"))
+            .and(query_param("limit", "600"))
+            .and(query_param("subscribedFilter", "true"))
+            .respond_with(move |_request: &wiremock::Request| {
+                if calls_for_response.fetch_add(1, Ordering::SeqCst) == 0 {
+                    ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                        "data": {"total": 1, "channelList": [guide_row(1918, "115")]}
+                    }))
+                } else {
+                    ResponseTemplate::new(500)
+                }
+            })
+            .expect(2)
+            .mount(&server)
+            .await;
+
+        let state = TataplayState::new(true);
+        state.set_client_for_test(client_for(&server));
+        assert!(state.ensure_catalogue().await);
+        state.expire_catalogue_for_test();
+        assert!(!state.ensure_catalogue().await);
+        assert!(state.contains("tp_1918"));
+        assert_eq!(state.channels().len(), 1);
+        server.verify().await;
+    }
+
+    #[tokio::test]
+    async fn playback_failure_does_not_remove_a_catalogue_channel() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/lit-mobile-common-bff/api/v2/channels/guide"))
+            .and(query_param("limit", "600"))
+            .and(query_param("subscribedFilter", "true"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "data": {"total": 1, "channelList": [guide_row(1918, "115")]}
+            })))
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/lit-ls-config/pub/api/v1/config"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "data": {"app": {"dd": {"v1": "ZG5INSxTMSVDbSN1cFclZQ==", "v2": "YWVzRW5jcnlwdGlvbktleQ=="}}}
+            })))
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/pas/api/v1/access/control/LIVE/1918"))
+            .respond_with(ResponseTemplate::new(403).set_body_json(serde_json::json!({
+                "code": 130402,
+                "message": "Too many concurrent streams for device type."
+            })))
+            .mount(&server)
+            .await;
+
+        let state = TataplayState::new(true);
+        state.set_client_for_test(client_for(&server));
+        assert!(state.ensure_catalogue().await);
+        assert!(state.live("tp_1918").await.is_err());
+        assert!(
+            state.contains("tp_1918"),
+            "a tune-time refusal must not change the lineup"
+        );
+    }
+
+    #[tokio::test]
+    async fn xmltv_programmes_only_reference_catalogue_channels() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/lit-mobile-common-bff/api/v2/channels/guide"))
+            .and(query_param("limit", "600"))
+            .and(query_param("subscribedFilter", "true"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "data": {"total": 1, "channelList": [guide_row(1918, "115")]}
+            })))
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/lit-mobile-common-bff/api/v2/channels/guide"))
+            .and(query_param("limit", "200"))
+            .and(query_param("subscribedFilter", "true"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "data": {"total": 2, "channelList": [
+                    guide_row_with_epg(1918, "115"),
+                    guide_row_with_epg(1928, "116")
+                ]}
+            })))
+            .mount(&server)
+            .await;
+
+        let state = TataplayState::new(true);
+        state.set_client_for_test(client_for(&server));
+        let (sources, programmes) = state.epg_source().await.unwrap();
+        assert_eq!(sources.len(), 1);
+        assert_eq!(sources[0].0, "tp_1918");
+        assert!(!programmes.is_empty());
+        assert!(
+            programmes
+                .iter()
+                .all(|programme| programme.channel == "tp_1918"),
+            "a programme must never reference a channel outside the XMLTV set"
+        );
+    }
+
+    #[tokio::test]
+    async fn stale_guide_fetch_cannot_repopulate_after_clear() {
+        use tokio::sync::Notify;
+
+        let server = MockServer::start().await;
+        let started = Arc::new(Notify::new());
+        let started_for_response = started.clone();
+        Mock::given(method("GET"))
+            .and(path("/lit-mobile-common-bff/api/v2/channels/guide"))
+            .and(query_param("limit", "200"))
+            .and(query_param("subscribedFilter", "true"))
+            .respond_with(move |_request: &wiremock::Request| {
+                started_for_response.notify_one();
+                ResponseTemplate::new(200)
+                    .set_delay(Duration::from_millis(150))
+                    .set_body_json(serde_json::json!({
+                        "data": {"total": 1, "channelList": [guide_row_with_epg(1918, "115")]}
+                    }))
+            })
+            .mount(&server)
+            .await;
+
+        let state = Arc::new(TataplayState::new(true));
+        state.set_client_for_test(client_for(&server));
+        let today = crate::tataplay::tataplay_day_start();
+        let fetch = {
+            let state = state.clone();
+            tokio::spawn(async move { state.epg_day(today).await })
+        };
+        started.notified().await;
+        state.clear();
+        let _ = fetch.await.unwrap();
+        assert!(
+            state.epg_cache.read().unwrap().is_empty(),
+            "an old guide response must not repopulate the new context"
+        );
     }
 
     #[tokio::test]

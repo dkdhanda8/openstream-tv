@@ -523,30 +523,6 @@ impl Client {
         Ok(channels)
     }
 
-    /// Pack ids the account currently holds, or `None` when the endpoint does
-    /// not answer. An empty list is a real answer (no active packs).
-    pub async fn entitlement_packs(&self) -> anyhow::Result<Option<Vec<String>>> {
-        let value = self
-            .checked_json(
-                self.http
-                    .get(self.url("lit-subscription-service/api/v1/lit/getEntitlementDetails"))
-                    .header(reqwest::header::AUTHORIZATION, self.auth()?)
-                    .header(reqwest::header::USER_AGENT, "okhttp/4.12.0")
-                    .header("appVersion", VERSION_NAME)
-                    .header("platform", PLATFORM)
-                    .header("device_details", self.device.details())
-                    .header("locale", "ENG")
-                    .query(&[("forceRefresh", "true")]),
-                "entitlement",
-            )
-            .await?;
-        let data = payload(&value);
-        if data.get("entitlements").is_none() {
-            return Ok(None);
-        }
-        Ok(Some(string_vec(data.get("entitlements"))))
-    }
-
     pub async fn entitlement(&self, force_refresh: Option<bool>) -> anyhow::Result<Value> {
         let mut request = self
             .http
@@ -680,18 +656,10 @@ impl Client {
                 break;
             }
         }
-        let packs = match self.entitlement_packs().await {
-            Ok(Some(packs)) => Some(packs),
-            Ok(None) => None,
-            Err(error) => {
-                tracing::warn!(%error, "tataplay: cannot read entitlements; publishing the un-gated catalogue");
-                None
-            }
-        };
-        let mut rows: Vec<&GuideChannel> = channels
-            .iter()
-            .filter(|channel| channel.entitled_opt(packs.as_deref()))
-            .collect();
+        // `subscribedFilter=true` is the account's active lineup; the guide
+        // already applied the pack gate. Do not repeat it from pack ids: on
+        // the verification account that second filter dropped zero rows.
+        let mut rows: Vec<&GuideChannel> = channels.iter().collect();
         rows.sort_by(|a, b| {
             let an = a.channel_number.parse::<u32>();
             let bn = b.channel_number.parse::<u32>();
@@ -1003,26 +971,6 @@ pub struct GuideChannel {
 impl GuideChannel {
     pub fn channel_id(&self) -> String {
         channel_id(&self.id)
-    }
-
-    /// The app offers a channel when the account holds at least one of the
-    /// packs listed on it. An empty list means the cataloguer published no
-    /// gate, so the channel stays visible rather than being invented as
-    /// premium.
-    pub fn entitled_opt(&self, packs: Option<&[String]>) -> bool {
-        match packs {
-            // Entitlements are unavailable: keep the catalogue un-gated rather
-            // than inventing a premium gate.
-            None => true,
-            Some(packs) => {
-                self.entitlements.is_empty()
-                    || (!packs.is_empty()
-                        && self
-                            .entitlements
-                            .iter()
-                            .any(|pack| packs.iter().any(|held| held == pack)))
-            }
-        }
     }
 }
 
@@ -2027,20 +1975,5 @@ mod tests {
         assert!(!encoded.contains("cdn.invalid"));
         assert!(!encoded.contains("license.invalid"));
         assert!(!encoded.contains("session-value"));
-    }
-    #[test]
-    fn entitlements_keep_unknown_open_and_gate_confirmed_empty() {
-        let gated = GuideChannel {
-            entitlements: vec!["pack-a".into()],
-            ..Default::default()
-        };
-        let open = GuideChannel::default();
-        assert!(gated.entitled_opt(None), "unknown entitlements stay open");
-        assert!(
-            !gated.entitled_opt(Some(&[])),
-            "confirmed none gates premium"
-        );
-        assert!(gated.entitled_opt(Some(&["pack-a".into()])));
-        assert!(open.entitled_opt(Some(&[])));
     }
 }

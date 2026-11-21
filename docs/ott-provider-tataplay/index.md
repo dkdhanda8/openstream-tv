@@ -88,8 +88,10 @@ LIT account. The details below replace the earlier runtime gaps:
   200 channels carries programmes; a page of 530 returns metadata only. The
   client therefore reads metadata at 600 and programmes in 200-channel pages.
 - **Entitlements**: `getEntitlementDetails` returns the held pack ids in
-  `data.entitlements`. A channel is offered when its own `entitlements` array
-  intersects them; the live account held 5 packs and saw 356 of 530 channels.
+  `data.entitlements`; it is kept for diagnostics. The authenticated guide
+  with `subscribedFilter=true` is the account lineup (356 of 530 on the live
+  account). A second intersection with the held pack ids dropped zero rows and
+  is not applied.
 - **Playback**: `pas/api/v1/access/control/LIVE/<id>` returns a session id, a
   60-second heartbeat interval and AES-encrypted URLs under
   `data.playbackUrls`. Channels the account cannot stream return a null
@@ -140,6 +142,11 @@ message and a retry.
 The M3U licence property uses Kodi's four-field form:
 `<license-url>||R{SSM}|R`, with any `?q=` inside the URL before the pipes.
 
+The subscribed guide is the single lineup for `/api/channels`, the M3U, the
+XMLTV channel and programme entries, and direct web-guide lookups. A changed
+lineup clears cached guide days; a direct `/epg/:id` for a channel outside the
+lineup returns no rows. Playback failures do not change membership.
+
 The concurrency session's `POST`/`DELETE` must carry an OkHttp user agent
 (`okhttp/4.12.0`). Without it Akamai answers `403 Access Denied`, the heartbeat
 never starts, and the CDN freezes the live manifest at its first `publishTime`.
@@ -152,10 +159,12 @@ never starts, and the CDN freezes the live manifest at its first `publishTime`.
   the VOD rails/search contracts have not been proven live.
 - Channel language is not present in the guide row, so playlists publish
   `All Languages` until a per-channel detail fetch is worth the extra calls.
-- FTA channels can be entitled while access control returns no playback URL
-  (for example Star Utsav and Colors Rishtey in the verification account).
-  They remain in the catalogue and fail at play rather than being guessed
-  unplayable.
+- Subscribed feeds can be refused at play time while remaining in the lineup
+  (for example Star Sports HD without its HD add-on, and Star Utsav/Colors
+  Rishtey in the verification account). A null `playbackUrls` is not treated
+  as an unsubscribe signal. Per-channel `content-detail` has platform flags,
+  but a catalogue-wide probe of 356 channels tripped an Akamai 403 block and
+  was removed.
 
 ### Playback sessions
 
