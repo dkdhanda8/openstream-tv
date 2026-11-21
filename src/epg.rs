@@ -13,6 +13,7 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::io::Write;
 use std::path::Path as FsPath;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard, RwLock};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
@@ -44,6 +45,7 @@ pub struct EpgState {
     current_fingerprint: RwLock<Option<String>>,
     context_lock: Mutex<()>,
     generation_lock: tokio::sync::Mutex<()>,
+    preparing: AtomicBool,
 }
 
 impl EpgState {
@@ -594,10 +596,15 @@ pub fn trigger_regeneration(state: &Arc<AppState>) {
     if !state.config.epg {
         return;
     }
+    if state.epg_state.preparing.swap(true, Ordering::SeqCst) {
+        return;
+    }
     let state = state.clone();
     tokio::spawn(async move {
-        if let Err(e) = ensure_current_cache(&state).await {
-            tracing::warn!("EPG regeneration after account change failed: {e}");
+        let result = ensure_current_cache(&state).await;
+        state.epg_state.preparing.store(false, Ordering::SeqCst);
+        if let Err(e) = result {
+            tracing::warn!("EPG regeneration failed: {e}");
         }
     });
 }
@@ -609,6 +616,10 @@ pub fn trigger_regeneration(state: &Arc<AppState>) {
 pub async fn epg_handler(State(state): State<Arc<AppState>>) -> Response {
     let _guard = state.epg_state.context_guard();
     let Some(fingerprint) = state.epg_state.current_fingerprint() else {
+        // Startup preparation can fail while the provider is briefly
+        // unavailable. A request is the natural retry point; without this the
+        // artifact stayed "being prepared" until a restart or account change.
+        trigger_regeneration(&state);
         return (
             StatusCode::SERVICE_UNAVAILABLE,
             "EPG is being prepared for the active account",
@@ -617,11 +628,15 @@ pub async fn epg_handler(State(state): State<Arc<AppState>>) -> Response {
     };
     let path = cache_path(&state);
     if !cache_matches(&path, &fingerprint) {
+        trigger_regeneration(&state);
         return (
             StatusCode::SERVICE_UNAVAILABLE,
-            "EPG is not ready for the active account",
+            "EPG is being prepared for the active account",
         )
             .into_response();
+    }
+    if !cache_is_fresh(&path) {
+        trigger_regeneration(&state);
     }
     match std::fs::read(&path) {
         Ok(bytes) => Response::builder()
