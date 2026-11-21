@@ -15,13 +15,14 @@ use std::io::Write;
 use std::path::Path as FsPath;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard, RwLock};
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 const EPG_URL_FMT: &str =
     "https://jiotv.data.cdn.jio.com/apis/v1.3/getepg/get?offset={offset}&channel_id={id}";
 pub const EPG_POSTER_URL: &str = "https://jiotv.catchup.cdn.jio.com/dare_images/shows/";
 const CACHE_METADATA_VERSION: u32 = 1;
 const CACHE_MAX_AGE: Duration = Duration::from_secs(24 * 60 * 60);
+const PREPARATION_RETRY_COOLDOWN: Duration = Duration::from_secs(60);
 pub const STORE_KEY_ENABLED: &str = "epg_enabled";
 pub const COMPANION_APP_ENV: &str = "OPENSTREAM_COMPANION_APP";
 
@@ -46,11 +47,29 @@ pub struct EpgState {
     context_lock: Mutex<()>,
     generation_lock: tokio::sync::Mutex<()>,
     preparing: AtomicBool,
+    last_attempt: Mutex<Option<Instant>>,
 }
 
 impl EpgState {
     pub fn invalidate(&self) {
         *self.current_fingerprint.write().unwrap() = None;
+        *self.last_attempt.lock().unwrap() = None;
+    }
+
+    /// Claims a preparation slot. Returns false while one is running or when
+    /// the last failed attempt is still inside the retry cooldown, so a
+    /// provider outage cannot turn every request into another upstream call.
+    fn begin_preparation(&self) -> bool {
+        if self.preparing.swap(true, Ordering::SeqCst) {
+            return false;
+        }
+        let mut last = self.last_attempt.lock().unwrap();
+        if last.is_some_and(|at| at.elapsed() < PREPARATION_RETRY_COOLDOWN) {
+            self.preparing.store(false, Ordering::SeqCst);
+            return false;
+        }
+        *last = Some(Instant::now());
+        true
     }
 
     pub fn current_fingerprint(&self) -> Option<String> {
@@ -596,7 +615,7 @@ pub fn trigger_regeneration(state: &Arc<AppState>) {
     if !state.config.epg {
         return;
     }
-    if state.epg_state.preparing.swap(true, Ordering::SeqCst) {
+    if !state.epg_state.begin_preparation() {
         return;
     }
     let state = state.clone();
@@ -1438,6 +1457,20 @@ mod tests {
             .as_millis() as i64;
         assert_eq!(epg_day_offset_from_epoch(now_ms - 3 * DAY_MS), 3);
         assert_eq!(epg_day_offset_from_epoch(now_ms + DAY_MS), 0);
+    }
+
+    #[test]
+    fn preparation_retries_are_coalesced_and_rate_limited() {
+        let state = EpgState::default();
+        assert!(state.begin_preparation());
+        assert!(!state.begin_preparation(), "an in-flight attempt must win");
+        state.preparing.store(false, Ordering::SeqCst);
+        assert!(!state.begin_preparation(), "the cooldown must hold");
+        state.invalidate();
+        assert!(
+            state.begin_preparation(),
+            "an account change must retry immediately"
+        );
     }
 
     #[test]
