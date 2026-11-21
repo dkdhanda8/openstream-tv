@@ -1510,6 +1510,10 @@ mod tests {
             .and(header("platform", PLATFORM))
             .and(header("deviceId", "0123456789abcdef"))
             .and(header("deviceName", "Test TV"))
+            // Both are required by the edge even though the Retrofit
+            // annotation does not list them.
+            .and(header("locale", "ENG"))
+            .and(header("user-agent", "okhttp/4.12.0"))
             .and(body_json(json!({"rmn":"9876543210","sid":""})))
             .respond_with(ResponseTemplate::new(200).set_body_json(json!({
                 "data": {"jwtToken": jwt_with_refs()}

@@ -1174,6 +1174,12 @@ mod httpdate {
 mod tests {
     use super::*;
 
+    #[test]
+    fn hdnea_cookie_carries_both_akamai_and_legacy_names() {
+        assert_eq!(hdnea_cookie("token"), "hdnea=token; __hdnea__=token");
+    }
+
+
     fn fastway_app_state(
         store: Arc<crate::store::Store>,
         fastway: Arc<crate::fastway_state::FastwayState>,
