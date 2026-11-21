@@ -716,7 +716,13 @@ async fn render_mpd_inner(state: Arc<AppState>, q: RenderMpdQuery) -> Response {
     let enc_path = encrypt_dash_route_value(&state.secure, channel_id, &base_path);
 
     let encoded_channel = urlencoding::encode(channel_id);
-    let cached_hdnea = q.hdnea.clone();
+    // The token can arrive as an explicit query parameter (players that pass
+    // it through) or only inside the upstream manifest URL (Tata Play). Either
+    // way the segment route must carry it.
+    let cached_hdnea = q
+        .hdnea
+        .clone()
+        .or_else(|| crate::stream::extract_hdnea_from_url(&decrypted));
     let mut dash_base =
         format!("/render.dash/channel/{encoded_channel}/host/{enc_host}/path/{enc_path}");
     if let Some(h) = &cached_hdnea {
@@ -1066,6 +1072,13 @@ pub async fn render_dash_handler(
     builder.body(body).unwrap()
 }
 
+/// Akamai's token filter reads `hdnea` as a cookie. The `__hdnea__` name is
+/// what the JioTV/Fastway CDNs read; sending both keeps those paths working
+/// while Tata Play's `bpk-tv` origin accepts the request.
+fn hdnea_cookie(token: &str) -> String {
+    format!("hdnea={token}; __hdnea__={token}")
+}
+
 async fn proxy_dash_segment(
     state: &AppState,
     channel_id: &str,
@@ -1092,19 +1105,19 @@ async fn proxy_dash_segment(
             req = req.header(name.as_str(), value.as_str());
         }
         if let Some(t) = hdnea {
-            req = req.header(header::COOKIE, format!("__hdnea__={t}"));
+            req = req.header(header::COOKIE, hdnea_cookie(t));
         }
     } else {
         req = req.header(header::USER_AGENT, player_user_agent_for(state, url));
         if let Some(t) = hdnea {
-            req = req.header(header::COOKIE, format!("__hdnea__={t}"));
+            req = req.header(header::COOKIE, hdnea_cookie(t));
         }
     }
     #[cfg(not(feature = "beta"))]
     {
         req = req.header(header::USER_AGENT, player_user_agent_for(state, url));
         if let Some(t) = hdnea {
-            req = req.header(header::COOKIE, format!("__hdnea__={t}"));
+            req = req.header(header::COOKIE, hdnea_cookie(t));
         }
     }
     match req.send().await {

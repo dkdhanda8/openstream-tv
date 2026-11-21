@@ -5,7 +5,9 @@
 //! TTLs, per-account generation guards and cache invalidation.
 
 use crate::keyed_locks::KeyedLocks;
-use crate::tataplay::{document_id, AppKeys, Client, ResolvedPlayback};
+use crate::tataplay::{
+    document_id, AppKeys, Client, GuideChannel, GuideProgramme, ResolvedPlayback,
+};
 use crate::television::{Channel, LiveUrlOutput, Mpd};
 use sha2::{Digest, Sha256};
 use std::collections::HashMap;
@@ -17,6 +19,7 @@ const CATALOGUE_TTL: Duration = Duration::from_secs(30 * 60);
 const CATALOGUE_RETRY_BACKOFF: Duration = Duration::from_secs(15);
 const KEYS_TTL: Duration = Duration::from_secs(6 * 60 * 60);
 const PLAYBACK_TTL: Duration = Duration::from_secs(5 * 60);
+const EPG_TTL: Duration = Duration::from_secs(15 * 60);
 /// Stop beating once no media or license request has touched the playback for
 /// this long. Matches the playback TTL so an idle session is never resumed from
 /// a cache entry that has already expired.
@@ -45,6 +48,9 @@ pub struct TataplayState {
     catalogue_failed_at: RwLock<Option<Instant>>,
     keys: RwLock<Option<(AppKeys, Instant)>>,
     resolved: RwLock<HashMap<String, (ResolvedPlayback, Instant)>>,
+    /// Guide days keyed by IST midnight. Shared by XMLTV generation and the
+    /// per-channel web guide so one day is fetched once.
+    epg_cache: RwLock<HashMap<i64, (Vec<GuideChannel>, Instant)>>,
     /// Last media/license access, so the heartbeat can stop when playback ends.
     last_activity: Arc<Mutex<Instant>>,
     heartbeat: Mutex<Option<Heartbeat>>,
@@ -66,6 +72,7 @@ impl TataplayState {
             catalogue_failed_at: RwLock::new(None),
             keys: RwLock::new(None),
             resolved: RwLock::new(HashMap::new()),
+            epg_cache: RwLock::new(HashMap::new()),
             last_activity: Arc::new(Mutex::new(Instant::now())),
             heartbeat: Mutex::new(None),
             generation: AtomicU64::new(0),
@@ -136,6 +143,7 @@ impl TataplayState {
         *self.catalogue_failed_at.write().unwrap() = None;
         *self.keys.write().unwrap() = None;
         self.resolved.write().unwrap().clear();
+        self.epg_cache.write().unwrap().clear();
     }
 
     pub async fn logout(&self, store: &crate::store::Store) -> anyhow::Result<()> {
@@ -276,6 +284,109 @@ impl TataplayState {
             .any(|channel| channel.id == channel_id)
     }
 
+    /// One IST day of the guide, cached so XMLTV and the web guide share the
+    /// paged fetches that the BFF requires.
+    pub async fn epg_day(&self, day_start: i64) -> anyhow::Result<Vec<GuideChannel>> {
+        if let Some((channels, at)) = self.epg_cache.read().unwrap().get(&day_start) {
+            if at.elapsed() < EPG_TTL {
+                return Ok(channels.clone());
+            }
+        }
+        let generation = self.generation();
+        let client = self
+            .client()
+            .ok_or_else(|| anyhow::anyhow!("tataplay: not connected"))?;
+        let _guard = self.locks.lock(&format!("epg:{day_start}")).await;
+        if let Some((channels, at)) = self.epg_cache.read().unwrap().get(&day_start) {
+            if at.elapsed() < EPG_TTL {
+                return Ok(channels.clone());
+            }
+        }
+        let channels = client.guide_day(day_start).await?;
+        let now = Instant::now();
+        self.commit_if_current(generation, || {
+            self.epg_cache
+                .write()
+                .unwrap()
+                .insert(day_start, (channels.clone(), now));
+        });
+        Ok(channels)
+    }
+
+    /// Channels and the next two IST days' programmes, for
+    /// `epg::generate_xml_gz_from_sources`.
+    pub async fn epg_source(
+        &self,
+    ) -> anyhow::Result<(Vec<(String, String)>, Vec<crate::epg::XmlProgramme>)> {
+        self.ensure_catalogue().await;
+        let channels = self.channels();
+        let today = crate::tataplay::tataplay_day_start();
+        let mut guide: HashMap<String, Vec<GuideProgramme>> = HashMap::new();
+        let mut categories: HashMap<String, String> = HashMap::new();
+        for day in [today, today.saturating_add(86_400_000)] {
+            for channel in self.epg_day(day).await? {
+                categories
+                    .entry(channel.id.clone())
+                    .or_insert_with(|| channel.primary_genre.clone());
+                guide
+                    .entry(channel.id)
+                    .or_default()
+                    .extend(channel.programmes);
+            }
+        }
+        let mut sources = Vec::with_capacity(channels.len());
+        let mut programmes = Vec::new();
+        for channel in &channels {
+            sources.push((channel.id.clone(), channel.name.clone()));
+            let Some(document) = document_id(&channel.id) else {
+                continue;
+            };
+            let Some(rows) = guide.get(document) else {
+                continue;
+            };
+            let category = categories
+                .get(document)
+                .map(String::as_str)
+                .filter(|value| !value.is_empty())
+                .unwrap_or_else(|| crate::television::category_name(channel.category));
+            let mut seen = std::collections::HashSet::new();
+            for row in rows {
+                if !seen.insert((row.start_ms, row.end_ms)) {
+                    continue;
+                }
+                programmes.push(crate::epg::XmlProgramme {
+                    channel: channel.id.clone(),
+                    start: crate::epg::format_xmltv_time(row.start_ms),
+                    stop: crate::epg::format_xmltv_time(row.end_ms),
+                    title: row.title.clone(),
+                    desc: row.desc.clone(),
+                    category: category.to_string(),
+                    icon: row.icon.clone(),
+                });
+            }
+        }
+        Ok((sources, programmes))
+    }
+
+    /// One channel's programmes for a day offset, in the shared web-guide
+    /// shape.
+    pub async fn web_epg(
+        &self,
+        channel_id: &str,
+        offset_days: i64,
+    ) -> anyhow::Result<Vec<GuideProgramme>> {
+        let document = document_id(channel_id)
+            .ok_or_else(|| anyhow::anyhow!("tataplay: not a tataplay channel"))?;
+        let day = crate::tataplay::tataplay_day_start()
+            .saturating_add(offset_days.clamp(0, 6).saturating_mul(86_400_000));
+        let guide = self.epg_day(day).await?;
+        Ok(guide
+            .into_iter()
+            .find(|channel| channel.id == document)
+            .map(|channel| channel.programmes)
+            .unwrap_or_default())
+    }
+
     async fn app_keys(&self) -> Option<AppKeys> {
         if let Some((keys, at)) = self.keys.read().unwrap().as_ref() {
             if at.elapsed() < KEYS_TTL {
@@ -283,7 +394,13 @@ impl TataplayState {
             }
         }
         let client = self.client()?;
-        let keys = client.app_config().await.ok()?;
+        let keys = match client.app_config().await {
+            Ok(keys) => keys,
+            Err(error) => {
+                tracing::warn!(%error, "tataplay: cannot fetch the decryption keys");
+                return None;
+            }
+        };
         *self.keys.write().unwrap() = Some((keys.clone(), Instant::now()));
         Some(keys)
     }
@@ -296,9 +413,13 @@ impl TataplayState {
             }
         }
         let generation = self.generation();
-        let client = self.client()?;
+        let Some(client) = self.client() else {
+            tracing::warn!("tataplay: playback resolve has no client");
+            return None;
+        };
         let _guard = self.locks.lock(&format!("playback:{document}")).await;
         if self.generation() != generation {
+            tracing::warn!("tataplay: playback resolve lost its account generation");
             return None;
         }
         if let Some((resolved, at)) = self.resolved.read().unwrap().get(document) {
@@ -306,8 +427,17 @@ impl TataplayState {
                 return Some(resolved.clone());
             }
         }
-        let keys = self.app_keys().await?;
-        let resolved = client.play(document, &keys).await.ok()?;
+        let Some(keys) = self.app_keys().await else {
+            tracing::warn!("tataplay: playback resolve has no decryption keys");
+            return None;
+        };
+        let resolved = match client.play(document, &keys).await {
+            Ok(resolved) => resolved,
+            Err(error) => {
+                tracing::warn!(%error, "tataplay: playback resolve failed");
+                return None;
+            }
+        };
         let now = Instant::now();
         let clone = resolved.clone();
         self.commit_if_current(generation, || {
@@ -504,23 +634,32 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn catalogue_flattens_rails_and_dedupes() {
+    async fn catalogue_uses_the_guide_and_filters_by_pack_entitlement() {
         let server = MockServer::start().await;
         Mock::given(method("GET"))
-            .and(path("/homescreen/pub/api/v1/lit/hierarchy/LIT_LIVETV"))
-            .and(header("appVersion", crate::tataplay::VERSION_NAME))
-            .and(query_param("locale", "eng"))
+            .and(path("/lit-mobile-common-bff/api/v2/channels/guide"))
+            .and(header("sid", "sid-1"))
+            .and(query_param("limit", "600"))
             .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
-                "data": [
-                    {"railId": 1, "contentList": [
-                        {"id": 1918, "channelName": "Star Plus", "logo": "a.png", "hdChannel": true},
-                        {"id": 1914, "channelName": "Zee TV"}
-                    ]},
-                    {"railId": 2, "contentList": [
-                        {"id": 1918, "channelName": "Star Plus"},
-                        {"id": 40, "channelName": "Sony SAB"}
-                    ]}
-                ]
+                "data": {"total": 3, "channelList": [
+                    {"id": 1918, "title": "Star Plus", "channelNumber": "115",
+                     "hdChannel": true, "entitlements": ["held"],
+                     "boxCoverImage": "a.png"},
+                    {"id": 1914, "title": "Zee TV", "channelNumber": "120",
+                     "entitlements": ["missing"]},
+                    {"id": 40, "title": "Sony SAB", "channelNumber": "121",
+                     "entitlements": ["held", "other"], "restartTv": true}
+                ]}
+            })))
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path(
+                "/lit-subscription-service/api/v1/lit/getEntitlementDetails",
+            ))
+            .and(query_param("forceRefresh", "true"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "data": {"entitlements": ["held"]}
             })))
             .mount(&server)
             .await;
@@ -528,9 +667,13 @@ mod tests {
         state.set_client_for_test(client_for(&server));
         assert!(state.ensure_catalogue().await);
         let channels = state.channels();
-        assert_eq!(channels.len(), 3);
+        assert_eq!(channels.len(), 2);
         assert!(state.contains(&channel_id("1918")));
+        assert!(!state.contains(&channel_id("1914")));
         assert!(state.contains("tp_40"));
+        assert_eq!(channels[0].id, "tp_1918");
+        assert_eq!(channels[0].logo_url, "a.png");
+        assert!(channels[1].is_catchup_available);
     }
 
     #[tokio::test]

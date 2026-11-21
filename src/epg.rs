@@ -128,7 +128,7 @@ fn snapshot_fingerprint(
         #[cfg(feature = "beta")]
         crate::state::ActiveProduct::TataPlay => {
             hash_field(&mut hasher, &state.tataplay.account_fingerprint());
-            hash_field(&mut hasher, "tataplay-epg:channels-only");
+            hash_field(&mut hasher, "tataplay-live-epg:2days");
         }
     }
 
@@ -556,17 +556,14 @@ pub async fn regenerate_for_state(state: &Arc<AppState>) -> anyhow::Result<()> {
                 generate_xml_gz_from_sources(&state.http, Vec::new(), sources, programmes).await?
             }
         }
-        // Tata Play's guide endpoint needs epoch-millisecond start/end bounds
-        // whose runtime encoding is not yet proven, so only the channel list is
-        // published; no programme is invented.
         #[cfg(feature = "beta")]
         crate::state::ActiveProduct::TataPlay => {
-            let channels = snapshot
-                .channels
-                .iter()
-                .map(|ch| (ch.id.clone(), ch.name.clone()))
-                .collect();
-            generate_channels_only_xml_gz(channels)?
+            let (sources, programmes) = state.tataplay.epg_source().await?;
+            if programmes.is_empty() {
+                generate_channels_only_xml_gz(sources)?
+            } else {
+                generate_xml_gz_from_sources(&state.http, Vec::new(), sources, programmes).await?
+            }
         }
     };
 
@@ -748,6 +745,10 @@ pub async fn web_epg_handler(
     if crate::airtel::is_airtel_channel(&channel_id) {
         return airtel_web_epg(&state, &channel_id, &offset).await;
     }
+    #[cfg(feature = "beta")]
+    if crate::tataplay::is_tataplay_channel(&channel_id) {
+        return tataplay_web_epg(&state, &channel_id, &offset).await;
+    }
     if let Some(content_id) = crate::extras::content_id::content_id(&channel_id) {
         return extras_web_epg(&state, content_id, &offset).await;
     }
@@ -838,6 +839,33 @@ async fn airtel_web_epg(state: &AppState, channel_id: &str, offset: &str) -> Res
                 "startEpoch": p.start_millis(),
                 "endEpoch": p.end_millis(),
                 "episodePoster": "",
+            })
+        })
+        .collect();
+    axum::Json(serde_json::json!({ "epg": entries })).into_response()
+}
+
+/// Tata Play guide normalized to the same shape as JioTV/Fastway. Tata Play
+/// publishes epoch milliseconds already.
+#[cfg(feature = "beta")]
+async fn tataplay_web_epg(state: &AppState, channel_id: &str, offset: &str) -> Response {
+    let offset = match offset.parse::<i64>() {
+        Ok(o) if o >= 0 => o,
+        _ => return (StatusCode::BAD_REQUEST, "Invalid offset").into_response(),
+    };
+    let programmes = match state.tataplay.web_epg(channel_id, offset).await {
+        Ok(p) => p,
+        Err(e) => return (StatusCode::BAD_GATEWAY, e.to_string()).into_response(),
+    };
+    let entries: Vec<serde_json::Value> = programmes
+        .iter()
+        .map(|p| {
+            serde_json::json!({
+                "showname": p.title,
+                "description": p.desc,
+                "startEpoch": p.start_ms,
+                "endEpoch": p.end_ms,
+                "episodePoster": p.icon,
             })
         })
         .collect();

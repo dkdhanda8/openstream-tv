@@ -33,9 +33,6 @@ pub const STORE_KEY_CREDENTIALS: &str = "tataplay_credentials";
 pub const ID_PREFIX: &str = "tp_";
 /// Content type the access-control endpoint expects for a live channel.
 pub const CONTENT_TYPE_LIVE: &str = "LIVE";
-/// Home page whose rails carry the live channel catalogue.
-pub const HIERARCHY_PAGE: &str = "LIT_LIVETV";
-pub const LOCALE: &str = "eng";
 
 pub fn channel_id(document_id: &str) -> String {
     format!("{ID_PREFIX}{document_id}")
@@ -268,8 +265,18 @@ impl Client {
     ) -> anyhow::Result<Value> {
         tokio::time::timeout(HTTP_TIMEOUT, async {
             let response = request.send().await?;
-            if !response.status().is_success() {
-                anyhow::bail!("tataplay: {operation} failed: HTTP {}", response.status());
+            let status = response.status();
+            if !status.is_success() {
+                // The edge reports business failures as a JSON `message`; keep
+                // it so an OTP or entitlement refusal is actionable instead of
+                // a bare status code.
+                let body = response.text().await.unwrap_or_default();
+                let parsed = serde_json::from_str::<Value>(&body).unwrap_or(Value::Null);
+                let message = string_field(payload(&parsed), "message");
+                if message.is_empty() {
+                    anyhow::bail!("tataplay: {operation} failed: HTTP {status}");
+                }
+                anyhow::bail!("tataplay: {operation} failed: HTTP {status}: {message}");
             }
             Ok(response.json::<Value>().await?)
         })
@@ -293,8 +300,14 @@ impl Client {
                     .header("appVersion", VERSION_NAME)
                     .header("platform", PLATFORM)
                     .header(reqwest::header::CONTENT_TYPE, "application/json")
+                    .header(reqwest::header::USER_AGENT, "okhttp/4.12.0")
                     .header("deviceId", &self.device.device_id)
                     .header("deviceName", &self.device.device_name)
+                    // The edge rejects the request with a bare 403 when the
+                    // device profile or locale is absent, even though the
+                    // Retrofit contract lists only version/platform/ids.
+                    .header("device_details", self.device.details())
+                    .header("locale", "ENG")
                     .json(&json!({"rmn": rmn, "sid": sid})),
                 "send OTP",
             )
@@ -335,10 +348,15 @@ impl Client {
         {
             anyhow::bail!("tataplay: refId was not offered by the pending login");
         }
+        // The app sets `sid` from the refId whenever the offered account has a
+        // LIT or DTH service (MultipleSidDialogFragment: REFID = !services
+        // .isEmpty()). Every ref this client offers is filtered to exactly
+        // those services, so the reference is always also the session id.
+        let _ = ref_id_mode;
         let body = json!({
             "authorization": otp.trim(),
             "rmn": pending.rmn,
-            "sid": if ref_id_mode { ref_id } else { "" },
+            "sid": ref_id,
             "refId": ref_id,
             "loginOption": "OTP",
             "jwtToken": pending.jwt_token,
@@ -353,10 +371,12 @@ impl Client {
                     .header("appVersion", VERSION_NAME)
                     .header("platform", PLATFORM)
                     .header(reqwest::header::CONTENT_TYPE, "application/json")
+                    .header(reqwest::header::USER_AGENT, "okhttp/4.12.0")
                     // `device_details` is the serialized `DeviceDetails` model the
                     // app persists after onboarding; the interceptor forwards it
                     // verbatim.
                     .header("device_details", self.device.details())
+                    .header("locale", "ENG")
                     .json(&body),
                 "verify OTP",
             )
@@ -414,6 +434,7 @@ impl Client {
                     .get(self.url("portal-search/pub/api/v1/channels/all"))
                     .header("appVersion", VERSION_NAME)
                     .header("platform", PLATFORM)
+                    .header(reqwest::header::USER_AGENT, "okhttp/4.12.0")
                     .header(reqwest::header::CONTENT_TYPE, "application/json")
                     .query(&[("limit", limit), ("offset", offset)]),
                 "catalogue seed",
@@ -423,16 +444,16 @@ impl Client {
     }
 
     pub async fn guide(&self, query: &GuideQuery) -> anyhow::Result<Value> {
-        query.validate()?;
         let credentials = self
             .credentials
             .as_ref()
             .ok_or_else(|| anyhow::anyhow!("tataplay: login is required for EPG guide"))?;
-        let params = query.params(true);
+        let params = query.params(true)?;
         let request = self
             .http
             .get(self.url("lit-mobile-common-bff/api/v2/channels/guide"))
             .header(reqwest::header::CONTENT_TYPE, "application/json")
+            .header(reqwest::header::USER_AGENT, "okhttp/4.12.0")
             .header("sid", &credentials.sid)
             .header(reqwest::header::AUTHORIZATION, self.auth()?)
             .header("platform", PLATFORM)
@@ -441,11 +462,101 @@ impl Client {
         Ok(sanitize_guide(&value))
     }
 
+    /// One typed page of the guide. Bounds are epoch milliseconds; the same
+    /// call returns the channels and their programmes.
+    pub async fn guide_page(
+        &self,
+        start_ms: i64,
+        end_ms: i64,
+        limit: u32,
+        offset: u32,
+        subscribed: bool,
+    ) -> anyhow::Result<GuidePage> {
+        let credentials = self
+            .credentials
+            .as_ref()
+            .ok_or_else(|| anyhow::anyhow!("tataplay: login is required for EPG guide"))?;
+        if start_ms <= 0 || end_ms <= start_ms {
+            anyhow::bail!("tataplay: guide bounds must be epoch milliseconds");
+        }
+        let params = vec![
+            ("offset".to_string(), offset.to_string()),
+            ("limit".to_string(), limit.to_string()),
+            ("date".to_string(), tataplay_date(start_ms)),
+            ("epgStartTime".to_string(), start_ms.to_string()),
+            ("epgEndTime".to_string(), end_ms.to_string()),
+            ("subscribedFilter".to_string(), subscribed.to_string()),
+        ];
+        let request = self
+            .http
+            .get(self.url("lit-mobile-common-bff/api/v2/channels/guide"))
+            .header(reqwest::header::CONTENT_TYPE, "application/json")
+            .header(reqwest::header::USER_AGENT, "okhttp/4.12.0")
+            .header("sid", &credentials.sid)
+            .header(reqwest::header::AUTHORIZATION, self.auth()?)
+            .header("platform", PLATFORM)
+            .query(&params);
+        let value = self.checked_json(request, "EPG guide").await?;
+        Ok(parse_guide_page(&value))
+    }
+
+    /// Every channel and programme for one IST day, paged so the BFF keeps the
+    /// programme rows it drops from larger pages.
+    pub async fn guide_day(&self, day_start_ms: i64) -> anyhow::Result<Vec<GuideChannel>> {
+        let end = day_start_ms.saturating_add(86_400_000);
+        let mut offset = 0;
+        let mut channels = Vec::new();
+        loop {
+            let page = self
+                .guide_page(day_start_ms, end, GUIDE_PAGE_SIZE, offset, false)
+                .await?;
+            if page.channels.is_empty() {
+                break;
+            }
+            let received = page.channels.len() as u64;
+            channels.extend(page.channels);
+            offset = offset.saturating_add(received as u32);
+            if page.total == 0 || offset >= page.total as u32 {
+                break;
+            }
+        }
+        Ok(channels)
+    }
+
+    /// Pack ids the account currently holds, or `None` when the endpoint does
+    /// not answer. An empty list is a real answer (no active packs).
+    pub async fn entitlement_packs(&self) -> anyhow::Result<Option<Vec<String>>> {
+        let value = self
+            .checked_json(
+                self.http
+                    .get(self.url("lit-subscription-service/api/v1/lit/getEntitlementDetails"))
+                    .header(reqwest::header::AUTHORIZATION, self.auth()?)
+                    .header(reqwest::header::USER_AGENT, "okhttp/4.12.0")
+                    .header("appVersion", VERSION_NAME)
+                    .header("platform", PLATFORM)
+                    .header("device_details", self.device.details())
+                    .header("locale", "ENG")
+                    .query(&[("forceRefresh", "true")]),
+                "entitlement",
+            )
+            .await?;
+        let data = payload(&value);
+        if data.get("entitlements").is_none() {
+            return Ok(None);
+        }
+        Ok(Some(string_vec(data.get("entitlements"))))
+    }
+
     pub async fn entitlement(&self, force_refresh: Option<bool>) -> anyhow::Result<Value> {
         let mut request = self
             .http
             .get(self.url("lit-subscription-service/api/v1/lit/getEntitlementDetails"))
-            .header(reqwest::header::AUTHORIZATION, self.auth()?);
+            .header(reqwest::header::AUTHORIZATION, self.auth()?)
+            .header(reqwest::header::USER_AGENT, "okhttp/4.12.0")
+            .header("appVersion", VERSION_NAME)
+            .header("platform", PLATFORM)
+            .header("device_details", self.device.details())
+            .header("locale", "ENG");
         if let Some(force_refresh) = force_refresh {
             request = request.query(&[("forceRefresh", force_refresh)]);
         }
@@ -453,12 +564,42 @@ impl Client {
         Ok(sanitize_entitlement(&value))
     }
 
+    /// The access-control request the app's interceptor produces. The edge
+    /// returns 403 when the app version or user agent is missing even though
+    /// the Retrofit annotation lists neither.
+    fn access_request(
+        &self,
+        document: &str,
+        content_type: &str,
+    ) -> anyhow::Result<reqwest::RequestBuilder> {
+        let credentials = self.credentials()?;
+        Ok(self
+            .http
+            .get(self.url(&format!(
+                "pas/api/v1/access/control/{}/{}",
+                urlencoding::encode(content_type),
+                urlencoding::encode(document)
+            )))
+            .header(reqwest::header::CONTENT_TYPE, "application/json")
+            .header(reqwest::header::USER_AGENT, "okhttp/4.12.0")
+            .header("appVersion", VERSION_NAME)
+            .header(reqwest::header::AUTHORIZATION, self.auth()?)
+            .header("x-subscriber-id", &credentials.sid)
+            .header("platform", PLATFORM)
+            .header("locale", "ENG")
+            .header("device_details", self.device.details())
+            .header("x-device-id", &self.device.device_id)
+            .header("x-device-platform", "MOBILE")
+            .header("x-device-type", "ANDROID")
+            .header("x-subscriber-name", "Ancfg Both")
+            .header("x-device-name", &self.device.device_name))
+    }
+
     pub async fn access_control(
         &self,
         channel_id: &str,
         content_type: &str,
     ) -> anyhow::Result<Value> {
-        let credentials = self.credentials()?;
         if channel_id.trim().is_empty() {
             anyhow::bail!("tataplay: channel id is required");
         }
@@ -467,22 +608,7 @@ impl Client {
         } else {
             content_type.trim()
         };
-        let request = self
-            .http
-            .get(self.url(&format!(
-                "pas/api/v1/access/control/{}/{}",
-                urlencoding::encode(content_type),
-                urlencoding::encode(channel_id)
-            )))
-            .header(reqwest::header::CONTENT_TYPE, "application/json")
-            .header(reqwest::header::AUTHORIZATION, self.auth()?)
-            .header("x-subscriber-id", &credentials.subscriber_id)
-            .header("platform", PLATFORM)
-            .header("x-device-id", &self.device.device_id)
-            .header("x-device-platform", "MOBILE")
-            .header("x-device-type", "ANDROID")
-            .header("x-subscriber-name", "Ancfg Both")
-            .header("x-device-name", &self.device.device_name);
+        let request = self.access_request(channel_id, content_type)?;
         let (status, value) = tokio::time::timeout(HTTP_TIMEOUT, async {
             let response = request.send().await?;
             let status = response.status();
@@ -507,6 +633,8 @@ impl Client {
                     .get(self.url("lit-ls-config/pub/api/v1/config"))
                     .header("appVersion", VERSION_NAME)
                     .header("platform", PLATFORM)
+                    .header(reqwest::header::USER_AGENT, "okhttp/4.12.0")
+                    .header("locale", "ENG")
                     .header(reqwest::header::CONTENT_TYPE, "application/json"),
                 "app config",
             )
@@ -530,57 +658,51 @@ impl Client {
         Ok(keys)
     }
 
-    /// The live channel catalogue. `channels/all` returns only document ids, so
-    /// names, logos and flags come from the authenticated home hierarchy.
+    /// The live channel catalogue. `channels/all` and the home hierarchy carry
+    /// only ids or empty rails; the guide is the one authenticated document
+    /// that pairs every channel with its number, logo, flags and pack ids.
     pub async fn catalogue(&self) -> anyhow::Result<Vec<crate::television::Channel>> {
-        let credentials = self.credentials()?;
-        let value = self
-            .checked_json(
-                self.http
-                    .get(self.url(&format!(
-                        "homescreen/pub/api/v1/lit/hierarchy/{HIERARCHY_PAGE}"
-                    )))
-                    .header("appVersion", VERSION_NAME)
-                    .header("platform", PLATFORM)
-                    .header(reqwest::header::CONTENT_TYPE, "application/json")
-                    .header("deviceId", &self.device.device_id)
-                    .header(reqwest::header::AUTHORIZATION, self.auth()?)
-                    // The interceptor always sends an empty device token.
-                    .header("devicetoken", "")
-                    .header("x-authenticated-userid", &credentials.sid)
-                    .header("profileId", &credentials.sid)
-                    .query(&[("locale", LOCALE)]),
-                "catalogue",
-            )
+        let today = tataplay_day_start();
+        let page = self
+            .guide_page(today, today + 86_400_000, CATALOGUE_PAGE_SIZE, 0, false)
             .await?;
-        Ok(parse_catalogue(&value))
+        let packs = match self.entitlement_packs().await {
+            Ok(Some(packs)) => packs,
+            Ok(None) => Vec::new(),
+            Err(error) => {
+                tracing::warn!(%error, "tataplay: cannot read entitlements; publishing the un-gated catalogue");
+                Vec::new()
+            }
+        };
+        let mut rows: Vec<&GuideChannel> = page
+            .channels
+            .iter()
+            .filter(|channel| channel.entitled(&packs))
+            .collect();
+        rows.sort_by(|a, b| {
+            let an = a.channel_number.parse::<u32>();
+            let bn = b.channel_number.parse::<u32>();
+            match (an, bn) {
+                (Ok(a), Ok(b)) if a != b => a.cmp(&b),
+                _ => a.name.to_lowercase().cmp(&b.name.to_lowercase()),
+            }
+        });
+        Ok(rows.into_iter().map(guide_channel_to_channel).collect())
     }
 
     /// Resolves a live channel to a playable DASH manifest and Widevine license
     /// URL, both decrypted with the app-config keys.
     pub async fn play(&self, document: &str, keys: &AppKeys) -> anyhow::Result<ResolvedPlayback> {
-        let credentials = self.credentials()?;
         if document.trim().is_empty() {
             anyhow::bail!("tataplay: channel id is required");
         }
-        let request = self
-            .http
-            .get(self.url(&format!(
-                "pas/api/v1/access/control/{CONTENT_TYPE_LIVE}/{}",
-                urlencoding::encode(document)
-            )))
-            .header(reqwest::header::CONTENT_TYPE, "application/json")
-            .header(reqwest::header::AUTHORIZATION, self.auth()?)
-            .header("x-subscriber-id", &credentials.subscriber_id)
-            .header("platform", PLATFORM)
-            .header("x-device-id", &self.device.device_id)
-            .header("x-device-platform", "MOBILE")
-            .header("x-device-type", "ANDROID")
-            .header("x-subscriber-name", "Ancfg Both")
-            .header("x-device-name", &self.device.device_name);
+        let request = self.access_request(document, CONTENT_TYPE_LIVE)?;
         let value = self.checked_json(request, "playback").await?;
         let data = payload(&value);
         let playback = data.get("playbackUrls").unwrap_or(&Value::Null);
+        if playback.is_null() {
+            anyhow::bail!("tataplay: this account cannot play the channel right now");
+        }
         let play_raw = first_field(&[playback, data], "dashWidewinePlayUrl");
         if play_raw.is_empty() {
             anyhow::bail!("tataplay: playback response has no DASH manifest URL");
@@ -638,7 +760,7 @@ impl Client {
             .request(method, self.url("smgs/api/v1/session"))
             .header(reqwest::header::CONTENT_TYPE, "application/json")
             .header(reqwest::header::AUTHORIZATION, self.auth()?)
-            .header("x-subscriber-id", &credentials.subscriber_id)
+            .header("x-subscriber-id", &credentials.sid)
             .header("x-authenticated-userid", &credentials.sid)
             .header("platform", PLATFORM)
             .header("x-device-id", &self.device.device_id)
@@ -759,57 +881,228 @@ fn first_field(sources: &[&Value], key: &str) -> String {
 }
 
 /// Flattens every rail of the `LIT_LIVETV` hierarchy into one channel list.
-fn parse_catalogue(value: &Value) -> Vec<crate::television::Channel> {
-    use std::collections::HashSet;
-
-    let mut seen: HashSet<String> = HashSet::new();
-    let mut out: Vec<crate::television::Channel> = Vec::new();
-    let Some(rails) = payload(value).as_array() else {
-        return out;
-    };
-    for rail in rails {
-        let Some(entries) = rail.get("contentList").and_then(Value::as_array) else {
-            continue;
-        };
-        for entry in entries {
-            let id = entry.get("id").map(json_id).unwrap_or_default();
-            if id.is_empty() || !seen.insert(id.clone()) {
-                continue;
-            }
-            let name = first_field(&[entry], "channelName");
-            let name = if name.is_empty() {
-                first_field(&[entry], "name")
-            } else {
-                name
-            };
-            let logo = first_field(&[entry], "logo");
-            let logo = if logo.is_empty() {
-                first_field(&[entry], "channelPosterImage")
-            } else {
-                logo
-            };
-            out.push(crate::television::Channel {
-                id: channel_id(&id),
-                name,
-                logo_url: logo,
-                is_hd: entry
-                    .get("hdChannel")
-                    .and_then(Value::as_bool)
-                    .unwrap_or(false),
-                is_catchup_available: entry
-                    .get("restartTvAllowed")
-                    .and_then(Value::as_bool)
-                    .unwrap_or(false)
-                    || entry
-                        .get("cdvrEnabled")
-                        .and_then(Value::as_bool)
-                        .unwrap_or(false),
-                ..Default::default()
-            });
+/// Maps Tata Play's primary genres to the ids the shared UI groups by. The
+/// provider uses its own vocabulary (`TV Shows`, `Spiritual`), so the shared
+/// map alone would put every channel under All Categories.
+fn category_id(genres: &[String], primary: &str) -> i64 {
+    fn mapped(name: &str) -> Option<i64> {
+        Some(match name.trim().to_ascii_lowercase().as_str() {
+            "news" => 12,
+            "tv shows" => 5,
+            "movies" => 6,
+            "spiritual" | "devotional" => 15,
+            "music" => 13,
+            "knowledge & lifestyle" | "lifestyle" => 9,
+            "kids" => 7,
+            "sports" => 8,
+            "business" => 16,
+            "regional" => 20,
+            _ => return None,
+        })
+    }
+    if let Some(id) = mapped(primary) {
+        return id;
+    }
+    for name in genres {
+        if let Some(id) = mapped(name) {
+            return id;
         }
     }
-    out.sort_by_cached_key(|channel| channel.name.to_lowercase());
-    out
+    let mut names = Vec::with_capacity(genres.len() + 1);
+    if !primary.trim().is_empty() {
+        names.push(primary.trim());
+    }
+    names.extend(genres.iter().map(String::as_str));
+    for name in names {
+        if let Some((id, _)) = crate::television::CATEGORY_MAP
+            .iter()
+            .find(|(id, value)| *id != 0 && value.eq_ignore_ascii_case(name))
+        {
+            return *id;
+        }
+    }
+    0
+}
+
+fn guide_channel_to_channel(channel: &GuideChannel) -> crate::television::Channel {
+    crate::television::Channel {
+        id: channel.channel_id(),
+        name: channel.name.clone(),
+        logo_url: channel.logo.clone(),
+        category: category_id(&channel.genres, &channel.primary_genre),
+        is_hd: channel.hd,
+        is_catchup_available: channel.catchup,
+        package_ids: channel.entitlements.clone(),
+        ..Default::default()
+    }
+}
+
+/// The BFF drops programme rows when a page asks for every channel at once,
+/// so the guide is read in pages. 200 is the largest page observed to carry
+/// programmes for the whole day.
+pub const GUIDE_PAGE_SIZE: u32 = 200;
+/// Metadata-only page used to hydrate the catalogue (no programmes).
+pub const CATALOGUE_PAGE_SIZE: u32 = 600;
+
+/// One programme from the guide. Times are epoch milliseconds.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct GuideProgramme {
+    pub id: String,
+    pub start_ms: i64,
+    pub end_ms: i64,
+    pub title: String,
+    pub desc: String,
+    pub icon: String,
+    pub catchup: bool,
+}
+
+/// One channel row from the guide, including the pack ids that entitle it.
+#[derive(Debug, Clone, Default)]
+pub struct GuideChannel {
+    pub id: String,
+    pub name: String,
+    pub channel_number: String,
+    pub genres: Vec<String>,
+    pub primary_genre: String,
+    pub logo: String,
+    pub hd: bool,
+    pub catchup: bool,
+    pub entitlements: Vec<String>,
+    pub programmes: Vec<GuideProgramme>,
+}
+
+impl GuideChannel {
+    pub fn channel_id(&self) -> String {
+        channel_id(&self.id)
+    }
+
+    /// The app offers a channel when the account holds at least one of the
+    /// packs listed on it. An empty list means the cataloguer published no
+    /// gate, so the channel stays visible rather than being invented as
+    /// premium.
+    pub fn entitled(&self, packs: &[String]) -> bool {
+        self.entitlements.is_empty()
+            || packs.is_empty()
+            || self
+                .entitlements
+                .iter()
+                .any(|pack| packs.iter().any(|held| held == pack))
+    }
+}
+
+/// A guide page: the channel rows plus the upstream total for pagination.
+#[derive(Debug, Clone, Default)]
+pub struct GuidePage {
+    pub total: u64,
+    pub channels: Vec<GuideChannel>,
+}
+
+fn epoch_millis(value: Option<&Value>) -> i64 {
+    match value {
+        Some(Value::Number(number)) => number.as_i64().unwrap_or_default(),
+        Some(Value::String(text)) => text.trim().parse().unwrap_or_default(),
+        _ => 0,
+    }
+}
+
+fn string_vec(value: Option<&Value>) -> Vec<String> {
+    value
+        .and_then(Value::as_array)
+        .map(|items| {
+            items
+                .iter()
+                .map(json_id)
+                .filter(|s| !s.is_empty())
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+fn parse_guide_page(value: &Value) -> GuidePage {
+    let data = payload(value);
+    let total = data.get("total").and_then(Value::as_u64).unwrap_or(0);
+    let channels = data
+        .get("channelList")
+        .and_then(Value::as_array)
+        .map(|rows| rows.iter().filter_map(parse_guide_channel).collect())
+        .unwrap_or_default();
+    GuidePage { total, channels }
+}
+
+fn parse_guide_channel(row: &Value) -> Option<GuideChannel> {
+    let id = json_id(row.get("id")?);
+    if id.is_empty() {
+        return None;
+    }
+    let logo = first_field(&[row], "boxCoverImage");
+    let logo = if logo.is_empty() {
+        first_field(&[row], "posterImage")
+    } else {
+        logo
+    };
+    let logo = if logo.is_empty() {
+        first_field(&[row], "thumbnailImage")
+    } else {
+        logo
+    };
+    let programmes = row
+        .get("epg")
+        .and_then(Value::as_array)
+        .map(|items| {
+            items
+                .iter()
+                .filter_map(|item| {
+                    let start_ms = epoch_millis(item.get("startTime"));
+                    let end_ms = epoch_millis(item.get("endTime"));
+                    if start_ms <= 0 || end_ms <= start_ms {
+                        return None;
+                    }
+                    Some(GuideProgramme {
+                        id: item.get("epgSlotId").map(json_id).unwrap_or_default(),
+                        start_ms,
+                        end_ms,
+                        title: string_field(item, "title"),
+                        desc: string_field(item, "desc"),
+                        icon: string_field(item, "imageUrl"),
+                        catchup: item
+                            .get("litCatchup")
+                            .and_then(Value::as_bool)
+                            .unwrap_or(false)
+                            || item
+                                .get("catchup")
+                                .and_then(Value::as_bool)
+                                .unwrap_or(false),
+                    })
+                })
+                .collect()
+        })
+        .unwrap_or_default();
+    Some(GuideChannel {
+        id,
+        name: string_field(row, "title"),
+        channel_number: match row.get("channelNumber") {
+            Some(Value::String(text)) => text.clone(),
+            Some(Value::Number(number)) => number.to_string(),
+            _ => String::new(),
+        },
+        genres: string_vec(row.get("genres")),
+        primary_genre: string_field(row, "primaryGenre"),
+        logo,
+        hd: row
+            .get("hdChannel")
+            .and_then(Value::as_bool)
+            .unwrap_or(false),
+        catchup: row
+            .get("restartTv")
+            .and_then(Value::as_bool)
+            .unwrap_or(false)
+            || row
+                .get("isCloudDvr")
+                .and_then(Value::as_bool)
+                .unwrap_or(false),
+        entitlements: string_vec(row.get("entitlements")),
+        programmes,
+    })
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -831,31 +1124,49 @@ pub struct GuideQuery {
 }
 
 impl GuideQuery {
-    fn validate(&self) -> anyhow::Result<()> {
-        if self.date.as_deref().unwrap_or("").is_empty()
-            || self.epg_start_time.as_deref().unwrap_or("").is_empty()
-            || self.epg_end_time.as_deref().unwrap_or("").is_empty()
-        {
-            anyhow::bail!(
-                "tataplay: date, epgStartTime and epgEndTime are required; runtime encoding is intentionally not guessed"
-            );
+    /// The guide takes epoch-millisecond bounds, which the live API proves by
+    /// returning programmes for numeric values and an empty list for seconds.
+    /// `date` is derived from the bounds when omitted.
+    fn bounds(&self) -> anyhow::Result<(i64, i64, String)> {
+        let start = self
+            .epg_start_time
+            .as_deref()
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .map(str::parse::<i64>)
+            .transpose()
+            .map_err(|_| anyhow::anyhow!("tataplay: epgStartTime must be epoch milliseconds"))?
+            .unwrap_or_else(tataplay_day_start);
+        let end = self
+            .epg_end_time
+            .as_deref()
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .map(str::parse::<i64>)
+            .transpose()
+            .map_err(|_| anyhow::anyhow!("tataplay: epgEndTime must be epoch milliseconds"))?
+            .unwrap_or_else(|| start.saturating_add(86_400_000));
+        if start <= 0 || end <= start {
+            anyhow::bail!("tataplay: epgEndTime must be after epgStartTime");
         }
-        Ok(())
+        let date = self
+            .date
+            .as_deref()
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .map(str::to_string)
+            .unwrap_or_else(|| tataplay_date(start));
+        Ok((start, end, date))
     }
 
-    fn params(&self, authenticated: bool) -> Vec<(String, String)> {
+    fn params(&self, authenticated: bool) -> anyhow::Result<Vec<(String, String)>> {
+        let (start, end, date) = self.bounds()?;
         let mut out = vec![
             ("offset".into(), self.offset.unwrap_or(0).to_string()),
             ("limit".into(), self.limit.unwrap_or(100).to_string()),
-            ("date".into(), self.date.clone().unwrap_or_default()),
-            (
-                "epgStartTime".into(),
-                self.epg_start_time.clone().unwrap_or_default(),
-            ),
-            (
-                "epgEndTime".into(),
-                self.epg_end_time.clone().unwrap_or_default(),
-            ),
+            ("date".into(), date),
+            ("epgStartTime".into(), start.to_string()),
+            ("epgEndTime".into(), end.to_string()),
         ];
         if let Some(value) = &self.category_filters {
             out.push(("categoryFilters".into(), value.clone()));
@@ -869,8 +1180,27 @@ impl GuideQuery {
                 self.subscribed_filter.unwrap_or(false).to_string(),
             ));
         }
-        out
+        Ok(out)
     }
+}
+
+/// Local (IST) midnight for the current moment, in epoch milliseconds. Tata
+/// Play's guide is published against IST days; the server may run elsewhere.
+pub fn tataplay_day_start() -> i64 {
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis() as i64)
+        .unwrap_or_default();
+    let ist = now.saturating_add(crate::epg::IST_OFFSET_MS);
+    ist.saturating_sub(ist.rem_euclid(86_400_000))
+        .saturating_sub(crate::epg::IST_OFFSET_MS)
+}
+
+/// `YYYY-MM-DD` for an epoch-millisecond instant in IST.
+pub fn tataplay_date(epoch_ms: i64) -> String {
+    let secs = (epoch_ms.saturating_add(crate::epg::IST_OFFSET_MS) / 1000).max(0) as u64;
+    let (y, mo, d, _, _, _) = crate::television::civil_from_unix(secs);
+    format!("{y:04}-{mo:02}-{d:02}")
 }
 
 fn payload(value: &Value) -> &Value {
@@ -897,10 +1227,20 @@ fn credentials_from_response(value: &Value) -> anyhow::Result<Credentials> {
         .and_then(Value::as_str)
         .unwrap_or_else(|| data.get("sid").and_then(Value::as_str).unwrap_or_default())
         .to_string();
+    // The app sends the session `sid` under every subscriber header (RD0 maps
+    // `x-subscriber-id`, `subscriberId` and `x-authenticated-userid` to
+    // `SessionManager.sid`). The login payload has no top-level `subscriberId`,
+    // so the sid is also the subscriber identity for the device endpoints.
+    let user_details = data.get("userDetails").unwrap_or(&Value::Null);
+    let subscriber_id = first_field(&[data, user_details], "subscriberId");
     Ok(Credentials {
         access_token,
         refresh_token: string_field(data, "refreshToken"),
-        subscriber_id: string_field(data, "subscriberId"),
+        subscriber_id: if subscriber_id.is_empty() {
+            sid.clone()
+        } else {
+            subscriber_id
+        },
         sid,
     })
 }
@@ -1037,6 +1377,12 @@ fn sanitize_entitlement(value: &Value) -> Value {
 
 fn sanitize_access_control(status: u16, content_type: &str, value: &Value) -> Value {
     let data = payload(value);
+    // The signed URLs live under `playbackUrls`; older responses put them at
+    // the top level, so inspect both without exposing either.
+    let playback = data
+        .get("playbackUrls")
+        .filter(|value| !value.is_null())
+        .unwrap_or(data);
     let has_play_url = [
         "dashWidewinePlayUrl",
         "dashPlayreadyPlayUrl",
@@ -1044,21 +1390,30 @@ fn sanitize_access_control(status: u16, content_type: &str, value: &Value) -> Va
         "trailerUrl",
     ]
     .iter()
-    .any(|key| !string_field(data, key).is_empty());
+    .any(|key| !string_field(playback, key).is_empty());
     let entitlement_count = data
         .get("entitlements")
+        .or_else(|| playback.get("entitlements"))
         .and_then(Value::as_array)
         .map(Vec::len)
         .unwrap_or(0);
     json!({
         "upstreamStatus": status,
         "authorized": (200..300).contains(&status) && has_play_url,
-        "contentType": data.get("contentType").and_then(Value::as_str).unwrap_or(content_type),
-        "contentId": data.get("contentId").cloned().unwrap_or(Value::Null),
-        "hasDashWidevinePlayUrl": !string_field(data, "dashWidewinePlayUrl").is_empty(),
-        "hasDashWidevineLicenseUrl": !string_field(data, "dashWidewineLicenseUrl").is_empty(),
-        "hasDashPlayreadyPlayUrl": !string_field(data, "dashPlayreadyPlayUrl").is_empty(),
-        "hasDashPlayreadyLicenseUrl": !string_field(data, "dashPlayreadyLicenseUrl").is_empty(),
+        "contentType": data
+            .get("contentType")
+            .or_else(|| playback.get("contentType"))
+            .and_then(Value::as_str)
+            .unwrap_or(content_type),
+        "contentId": data
+            .get("contentId")
+            .or_else(|| playback.get("contentId"))
+            .cloned()
+            .unwrap_or(Value::Null),
+        "hasDashWidevinePlayUrl": !string_field(playback, "dashWidewinePlayUrl").is_empty(),
+        "hasDashWidevineLicenseUrl": !string_field(playback, "dashWidewineLicenseUrl").is_empty(),
+        "hasDashPlayreadyPlayUrl": !string_field(playback, "dashPlayreadyPlayUrl").is_empty(),
+        "hasDashPlayreadyLicenseUrl": !string_field(playback, "dashPlayreadyLicenseUrl").is_empty(),
         "hasSessionId": !string_field(data, "sessionId").is_empty(),
         "heartbeatInterval": data.get("heartbeatInterval").cloned().unwrap_or(Value::Null),
         "entitlementCount": entitlement_count
@@ -1178,7 +1533,7 @@ mod tests {
             .and(body_json(json!({
                 "authorization":"123456",
                 "rmn":"9876543210",
-                "sid":"",
+                "sid":"lit-1",
                 "refId":"lit-1",
                 "loginOption":"OTP",
                 "jwtToken":jwt_with_refs(),
@@ -1293,7 +1648,7 @@ mod tests {
         Mock::given(method("POST"))
             .and(path("/smgs/api/v1/session"))
             .and(header("Authorization", "bearer access-value"))
-            .and(header("x-subscriber-id", "sub-1"))
+            .and(header("x-subscriber-id", "sid-1"))
             .and(header("x-authenticated-userid", "sid-1"))
             .and(header("platform", PLATFORM))
             .and(header("x-device-id", "0123456789abcdef"))
@@ -1373,7 +1728,7 @@ mod tests {
         Mock::given(method("GET"))
             .and(path("/pas/api/v1/access/control/LIVE/123"))
             .and(header("Authorization", "bearer access-value"))
-            .and(header("x-subscriber-id", "sub-1"))
+            .and(header("x-subscriber-id", "sid-1"))
             .and(header("platform", PLATFORM))
             .and(header("x-device-id", "0123456789abcdef"))
             .and(header("x-device-platform", "MOBILE"))
@@ -1382,11 +1737,14 @@ mod tests {
             .and(header("x-device-name", "Test TV"))
             .respond_with(ResponseTemplate::new(200).set_body_json(json!({
                 "data": {
-                    "contentId":"123",
-                    "contentType":"LIVE",
-                    "dashWidewinePlayUrl":"https://cdn.invalid/manifest.mpd",
-                    "dashWidewineLicenseUrl":"https://license.invalid/wv",
-                    "sessionId":"session-value"
+                    "sessionId":"session-value",
+                    "heartbeatInterval": 60,
+                    "playbackUrls": {
+                        "contentId":"123",
+                        "contentType":"LIVE",
+                        "dashWidewinePlayUrl":"https://cdn.invalid/manifest.mpd",
+                        "dashWidewineLicenseUrl":"https://license.invalid/wv"
+                    }
                 }
             })))
             .mount(&server)

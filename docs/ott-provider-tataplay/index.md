@@ -62,13 +62,64 @@ Playback URLs are AES-encrypted. `pas/api/v1/access/control/LIVE/<id>` returns
 config and `channels/all` answer without authentication, so the keys and the
 document-id map are available before login.
 
+### Live-verified contracts (2026-11-21)
+
+The OTP, guide, entitlement and playback paths were verified against a live
+LIT account. The details below replace the earlier runtime gaps:
+
+- **Send OTP** (`POST login-service/pub/api/v3/signin/generate/otp`) needs the
+  `device_details` header, a locale and an OkHttp user agent in addition to
+  `appVersion`/`platform`/`deviceId`/`deviceName`. Without the device profile
+  the edge answers a bare `403`.
+- **Verify OTP** (`POST login-service/pub/api/v3/signin/validate/otp`) sends the
+  chosen `refId` in both `refId` and `sid`. The app sets `sid` from the refId
+  whenever the offered account lists a LIT or DTH service, which is every ref
+  this client offers, so an empty `sid` is rejected.
+- **Login response** has no top-level `subscriberId`: the session `sid` under
+  `userDetails.sid` is the subscriber identity used by the device, access
+  control and heartbeat endpoints. The same value is sent as `subscriberId`,
+  `x-subscriber-id`, `sid` and `x-authenticated-userid`.
+- **Catalogue**: `homescreen/.../hierarchy/LIT_LIVETV` returns an empty `data`
+  array for this app generation, and `channels/all` carries only document ids.
+  The authenticated guide is the catalogue source: it pairs every channel with
+  its number, logo, HD/catch-up flags and pack ids.
+- **Guide**: `lit-mobile-common-bff/api/v2/channels/guide` takes epoch
+  **milliseconds** in `epgStartTime`/`epgEndTime` and an IST `date`. A page of
+  200 channels carries programmes; a page of 530 returns metadata only. The
+  client therefore reads metadata at 600 and programmes in 200-channel pages.
+- **Entitlements**: `getEntitlementDetails` returns the held pack ids in
+  `data.entitlements`. A channel is offered when its own `entitlements` array
+  intersects them; the live account held 5 packs and saw 356 of 530 channels.
+- **Playback**: `pas/api/v1/access/control/LIVE/<id>` returns a session id, a
+  60-second heartbeat interval and AES-encrypted URLs under
+  `data.playbackUrls`. Channels the account cannot stream return a null
+  `playbackUrls` with a success code. All live media is Widevine DASH.
+- **Media**: the decrypted manifest URL carries an Akamai `hdnea` token whose
+  ACL covers the channel directory. Akamai accepts it as the `hdnea` cookie;
+  the proxy sends both `hdnea` and the older `__hdnea__` name.
+- **Per-channel detail**: `content-detail/pub/api/v1/lit/ls/channel/<id>`
+  returns plain (unsigned) manifest/license URLs plus current, forward and
+  backward programme rows. The unsigned URLs are not playable by themselves;
+  access control remains the playback source.
+- **Packs held by the test account**: `Tata Play Smart Base May26`,
+  `DD Complimentary`, `FTA Complimentary HSM`, `Flexi Smart Add On English`,
+  `FTA Complimentary Regi`; concurrency `1`.
+
+With the guide encoding proven, XMLTV now publishes both days for the active
+catalogue (356 channels, 27,456 programmes in the verification run) and the web
+guide serves `/epg/<id>/<offset>` from the same cached days.
+
 ### Known gaps
 
-- EPG programmes are not published: the guide endpoint needs epoch-millisecond
-  `epgStartTime`/`epgEndTime` bounds whose runtime encoding is unproven, so
-  XMLTV contains channels only.
-- The OTP step still needs the `refId` and `refIdMode` values the app obtains
-  from the send-OTP JWT, so the client must pass the chosen account's `refId`.
+- Catch-up and on-demand surfaces are not wired: `catchupEpg` and
+  `myBox/epg` answered `Content does not exists` for the sampled channels, and
+  the VOD rails/search contracts have not been proven live.
+- Channel language is not present in the guide row, so playlists publish
+  `All Languages` until a per-channel detail fetch is worth the extra calls.
+- FTA channels can be entitled while access control returns no playback URL
+  (for example Star Utsav and Colors Rishtey in the verification account).
+  They remain in the catalogue and fail at play rather than being guessed
+  unplayable.
 
 ### Playback sessions
 

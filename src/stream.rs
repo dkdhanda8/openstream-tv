@@ -233,7 +233,7 @@ impl RenderCaches {
     }
 }
 
-fn extract_hdnea_from_url(u: &str) -> Option<String> {
+pub(crate) fn extract_hdnea_from_url(u: &str) -> Option<String> {
     let query = u.split('?').nth(1)?;
     for pair in query.split('&') {
         if let Some(v) = pair
