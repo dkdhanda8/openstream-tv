@@ -137,7 +137,8 @@ from an older tune are refused, including an older tune of the same channel.
 Irdeto can keep the closed channel's licence stream counted for minutes (5m41s
 in one run, about 2 minutes in another), so an immediate switch returns HTTP
 409 `Waiting for the previous stream to close`; the web player shows that
-message and a retry.
+message and retries automatically every five seconds for two minutes with a
+countdown, then leaves the manual retry.
 
 The M3U licence property uses Kodi's four-field form:
 `<license-url>||R{SSM}|R`, with any `?q=` inside the URL before the pipes.
@@ -145,7 +146,13 @@ The M3U licence property uses Kodi's four-field form:
 The subscribed guide is the single lineup for `/api/channels`, the M3U, the
 XMLTV channel and programme entries, and direct web-guide lookups. A changed
 lineup clears cached guide days; a direct `/epg/:id` for a channel outside the
-lineup returns no rows. Playback failures do not change membership.
+lineup returns no rows. Playback failures do not change membership. Selecting
+a custom or non-Tata channel cancels a pending Tata Play resolve and closes its
+session, so a late resolve cannot take the account's slot or publish itself.
+
+XMLTV generation retries a failed startup preparation from the next request,
+at most once a minute, and refreshes a stale matching artifact in the
+background.
 
 The concurrency session's `POST`/`DELETE` must carry an OkHttp user agent
 (`okhttp/4.12.0`). Without it Akamai answers `403 Access Denied`, the heartbeat
