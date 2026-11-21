@@ -1621,7 +1621,15 @@ pub async fn live_play(
     }
 
     if let Some(ch) = state.custom_channels.get(&id) {
-        return Json(json!({"dash": false, "url": ch.url, "license": null})).into_response();
+        // A local custom channel is played directly; a manifest ending in
+        // `.mpd` is still DASH even though no provider resolved it.
+        let dash = ch
+            .url
+            .split(['?', '#'])
+            .next()
+            .is_some_and(|path| path.to_ascii_lowercase().ends_with(".mpd"));
+        return Json(json!({"dash": dash, "url": ch.url, "license": null, "hls": null}))
+            .into_response();
     }
 
     // The response URLs are encrypted under the current context epoch, so the

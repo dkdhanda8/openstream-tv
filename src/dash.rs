@@ -513,14 +513,43 @@ async fn drm_license_impl(
     #[cfg(feature = "beta")]
     if crate::tataplay::is_tataplay_channel(&channel_id) {
         tracing::debug!(channel = %channel_id, url = %decoded_url, "tataplay license upstream");
-        let mut req = state
-            .http
-            .request(method, &decoded_url)
-            .header(header::CONTENT_TYPE, "application/octet-stream");
-        for (k, v) in state.tataplay.license_headers(&channel_id).await {
-            req = req.header(k.as_str(), v.as_str());
+        let build = |url: &str, headers: &[(String, String)]| {
+            let mut req = state
+                .http
+                .request(method.clone(), url)
+                .header(header::CONTENT_TYPE, "application/octet-stream");
+            for (k, v) in headers {
+                req = req.header(k.as_str(), v.as_str());
+            }
+            req
+        };
+        let headers = state.tataplay.license_headers(&channel_id).await;
+        let first = send_license_parts(build(&decoded_url, &headers), body.clone()).await;
+        // `130402` means the account is already at its stream limit; opening
+        // another session makes that worse, so only a spent token is retried.
+        let spent_token = first.0 == StatusCode::FORBIDDEN
+            && String::from_utf8_lossy(&first.1).contains("\"code\":130601");
+        if spent_token {
+            // Irdeto consumes the playback token with the first challenge.
+            // Shaka and ExoPlayer request audio and video keys separately, so
+            // the second challenge is refused `130601`. Resolve a fresh
+            // session and retry that challenge once.
+            if let Ok((license_url, token)) = state.tataplay.refresh_license(&channel_id).await {
+                tracing::debug!(
+                    channel = %channel_id,
+                    url = %license_url,
+                    "retrying tataplay license with a fresh token"
+                );
+                let mut retry_headers = headers;
+                retry_headers
+                    .retain(|(name, _)| !name.eq_ignore_ascii_case("authorization"));
+                retry_headers.push(("Authorization".into(), format!("Bearer {token}")));
+                return license_response(
+                    send_license_parts(build(&license_url, &retry_headers), body).await,
+                );
+            }
         }
-        return send_license_request(req, body).await;
+        return license_response(first);
     }
 
     // A extras channel's license is authorised by the token already in the
@@ -660,37 +689,54 @@ async fn send_airtel_license_request(
     }
 }
 
-async fn send_license_request(req: reqwest::RequestBuilder, body: Bytes) -> Response {
+async fn send_license_parts(
+    req: reqwest::RequestBuilder,
+    body: Bytes,
+) -> (StatusCode, Bytes, Option<String>) {
     tracing::debug!(challenge_bytes = body.len(), "license request");
     match req.body(body).send().await {
         Ok(resp) => {
             let status =
                 StatusCode::from_u16(resp.status().as_u16()).unwrap_or(StatusCode::BAD_GATEWAY);
-            let ct = resp.headers().get(header::CONTENT_TYPE).cloned();
+            let ct = resp
+                .headers()
+                .get(header::CONTENT_TYPE)
+                .and_then(|value| value.to_str().ok())
+                .map(str::to_string);
             let bytes = resp.bytes().await.unwrap_or_default();
             tracing::debug!(
                 status = status.as_u16(),
                 license_bytes = bytes.len(),
-                content_type = ct.as_ref()
-                    .and_then(|value| value.to_str().ok())
-                    .unwrap_or(""),
+                content_type = ct.as_deref().unwrap_or(""),
                 "license response"
             );
             if !status.is_success() {
                 let preview = String::from_utf8_lossy(&bytes[..bytes.len().min(300)]);
                 tracing::debug!(status = status.as_u16(), body = %preview, "license upstream rejected");
             }
-            let mut builder = Response::builder().status(status);
-            if let Some(ct) = ct {
-                builder = builder.header(header::CONTENT_TYPE, ct);
-            }
-            builder.body(Body::from(bytes)).unwrap()
+            (status, bytes, ct)
         }
         Err(error) => {
             tracing::debug!(%error, "license upstream request failed");
-            (StatusCode::BAD_GATEWAY, "license upstream request failed").into_response()
+            (
+                StatusCode::BAD_GATEWAY,
+                Bytes::from_static(b"license upstream request failed"),
+                Some("text/plain".to_string()),
+            )
         }
     }
+}
+
+fn license_response((status, bytes, ct): (StatusCode, Bytes, Option<String>)) -> Response {
+    let mut builder = Response::builder().status(status);
+    if let Some(ct) = ct {
+        builder = builder.header(header::CONTENT_TYPE, ct);
+    }
+    builder.body(Body::from(bytes)).unwrap()
+}
+
+async fn send_license_request(req: reqwest::RequestBuilder, body: Bytes) -> Response {
+    license_response(send_license_parts(req, body).await)
 }
 
 fn generate_date_time() -> String {
@@ -810,13 +856,22 @@ async fn render_mpd_inner(state: Arc<AppState>, q: RenderMpdQuery) -> Response {
         state.dash_state.record_publish_time(pt);
     }
 
-    if !body_str.contains("<UTCTiming") {
-        if let Some(idx) = body_str
-            .find("<MPD")
-            .and_then(|i| body_str[i..].find('>').map(|j| i + j + 1))
-        {
+    if let Some(root_end) = body_str
+        .find("<MPD")
+        .and_then(|i| body_str[i..].find('>').map(|j| i + j))
+    {
+        // The origin publishes its SegmentTimeline a couple of segments behind
+        // its own clock. Without a presentation delay Shaka asks for the
+        // not-yet-published edge, gets 404 and loops on the manifest.
+        let mut inserted = 0;
+        if !body_str[..root_end].contains("suggestedPresentationDelay") {
+            let attr = " suggestedPresentationDelay=\"PT24S\"";
+            body_str.insert_str(root_end, attr);
+            inserted = attr.len();
+        }
+        if !body_str.contains("<UTCTiming") {
             let utc_timing = "<UTCTiming schemeIdUri=\"urn:mpeg:dash:utc:http-xsdate:2014\" value=\"/dashtime\"/>";
-            body_str.insert_str(idx, utc_timing);
+            body_str.insert_str(root_end + inserted + 1, utc_timing);
         }
     }
 

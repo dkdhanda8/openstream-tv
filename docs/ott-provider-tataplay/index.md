@@ -116,6 +116,14 @@ With the guide encoding proven, XMLTV now publishes both days for the active
 catalogue (356 channels, 27,456 programmes in the verification run) and the web
 guide serves `/epg/<id>/<offset>` from the same cached days.
 
+The proxy also rewrites the live MPD with `suggestedPresentationDelay="PT24S"`
+because the origin's SegmentTimeline trails its own clock by a couple of
+segments; without it Shaka asks for unpublished segments and loops. A real
+Widevine challenge spends the playback token, so a `130601` answer is retried
+once with a fresh session and token, while `130402 Too many concurrent streams
+for device type` is returned as-is because another session already holds the
+account's single slot.
+
 ### Known gaps
 
 - Catch-up and on-demand surfaces are not wired: `catchupEpg` and

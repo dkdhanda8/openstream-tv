@@ -512,6 +512,19 @@ impl TataplayState {
         });
     }
 
+    /// Stops the beat and waits for the upstream DELETE, freeing the single
+    /// concurrency slot before a new access-control call.
+    async fn stop_heartbeat_and_wait(&self) {
+        let running = self.heartbeat.lock().unwrap().take();
+        let Some(running) = running else {
+            return;
+        };
+        running.task.abort();
+        if let Err(error) = running.client.end_session(&running.session_id).await {
+            tracing::debug!(%error, "tataplay session end failed");
+        }
+    }
+
     /// Closes the session owned by a different channel and waits for the
     /// upstream DELETE, so the next access-control call sees a free slot.
     async fn end_previous_session(&self, document: &str) {
@@ -606,6 +619,34 @@ impl TataplayState {
     }
 
     /// Headers the license proxy must add for a resolved Tata Play channel.
+    /// Resolves a fresh access-control session and returns its license URL and
+    /// playback token. Used when Irdeto refuses a challenge with `130601`
+    /// after the first licence, because the token is consumed by that one
+    /// challenge.
+    pub async fn refresh_license(&self, channel_id: &str) -> anyhow::Result<(String, String)> {
+        let document = document_id(channel_id)
+            .ok_or_else(|| anyhow::anyhow!("tataplay: not a tataplay channel"))?;
+        let _guard = self.locks.lock(&format!("license:{document}")).await;
+        let client = self
+            .client()
+            .ok_or_else(|| anyhow::anyhow!("tataplay: not connected"))?;
+        let keys = self
+            .app_keys()
+            .await
+            .ok_or_else(|| anyhow::anyhow!("tataplay: decryption keys are unavailable"))?;
+        // The account allows one live session. Close the one this playback
+        // already registered before asking for another, or the license
+        // endpoint answers `130402 Too many concurrent streams`.
+        self.stop_heartbeat_and_wait().await;
+        let resolved = client.play(document, &keys).await?;
+        self.resolved.write().unwrap().insert(
+            document.to_string(),
+            (resolved.clone(), Instant::now()),
+        );
+        self.start_heartbeat(&client, document, &resolved);
+        Ok((resolved.license_url, resolved.license_token))
+    }
+
     pub async fn license_headers(&self, channel_id: &str) -> Vec<(String, String)> {
         let Some(document) = document_id(channel_id) else {
             return Vec::new();
