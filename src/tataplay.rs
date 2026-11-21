@@ -658,6 +658,38 @@ impl Client {
         Ok(keys)
     }
 
+    /// Whether this account can play a channel on the web and mobile clients,
+    /// according to the channel detail page. `None` means the page did not
+    /// publish both flags; callers keep such channels rather than guessing.
+    pub async fn channel_playable(&self, document: &str) -> anyhow::Result<Option<bool>> {
+        let credentials = self
+            .credentials
+            .as_ref()
+            .ok_or_else(|| anyhow::anyhow!("tataplay: login is required for channel detail"))?;
+        let request = self
+            .http
+            .get(self.url(&format!(
+                "content-detail/pub/api/v1/lit/ls/channel/{}",
+                urlencoding::encode(document)
+            )))
+            .header(reqwest::header::CONTENT_TYPE, "application/json")
+            .header(reqwest::header::USER_AGENT, "okhttp/4.12.0")
+            .header(reqwest::header::AUTHORIZATION, self.auth()?)
+            .header("x-subscriber-id", &credentials.sid)
+            .header("x-authenticated-userid", &credentials.sid)
+            .header("sid", &credentials.sid)
+            .header("subscriberId", &credentials.sid)
+            .header("profileId", &credentials.sid)
+            .header("devicetoken", "")
+            .header("platform", PLATFORM)
+            .header("locale", "ENG")
+            .header("appVersion", VERSION_NAME)
+            .header("deviceId", &self.device.device_id)
+            .header("deviceName", &self.device.device_name);
+        let value = self.checked_json(request, "channel detail").await?;
+        Ok(playable_from_channel_detail(&value))
+    }
+
     /// The live channel catalogue. `channels/all` and the home hierarchy carry
     /// only ids or empty rails; the guide is the one authenticated document
     /// that pairs every channel with its number, logo, flags and pack ids.
@@ -1249,6 +1281,19 @@ fn string_field(value: &Value, key: &str) -> String {
         .and_then(Value::as_str)
         .unwrap_or_default()
         .to_string()
+}
+
+/// The playability flags from a channel detail response. A channel is active
+/// for the account when either the mobile or browser platform is entitled; a
+/// missing flag is unknown (`None`).
+fn playable_from_channel_detail(value: &Value) -> Option<bool> {
+    let meta = payload(value).get("channelMeta")?;
+    let mobile = meta.get("playableOnMobile").and_then(Value::as_bool);
+    let browser = meta.get("playableOnBrowsers").and_then(Value::as_bool);
+    if mobile.is_none() && browser.is_none() {
+        return None;
+    }
+    Some(mobile == Some(true) || browser == Some(true))
 }
 
 fn credentials_from_response(value: &Value) -> anyhow::Result<Credentials> {
@@ -2042,5 +2087,33 @@ mod tests {
         );
         assert!(gated.entitled_opt(Some(&["pack-a".into()])));
         assert!(open.entitled_opt(Some(&[])));
+    }
+    #[test]
+    fn channel_detail_playability_uses_either_platform_flag() {
+        let value = |mobile: Option<bool>, browser: Option<bool>| {
+            json!({
+                "data": {"channelMeta": {
+                    "playableOnMobile": mobile,
+                    "playableOnBrowsers": browser
+                }}
+            })
+        };
+        assert_eq!(
+            playable_from_channel_detail(&value(Some(false), Some(false))),
+            Some(false)
+        );
+        assert_eq!(
+            playable_from_channel_detail(&value(Some(true), Some(false))),
+            Some(true)
+        );
+        assert_eq!(
+            playable_from_channel_detail(&value(Some(false), Some(true))),
+            Some(true)
+        );
+        assert_eq!(
+            playable_from_channel_detail(&value(Some(true), Some(true))),
+            Some(true)
+        );
+        assert_eq!(playable_from_channel_detail(&value(None, None)), None);
     }
 }

@@ -20,6 +20,8 @@ const CATALOGUE_RETRY_BACKOFF: Duration = Duration::from_secs(15);
 const KEYS_TTL: Duration = Duration::from_secs(6 * 60 * 60);
 const PLAYBACK_TTL: Duration = Duration::from_secs(5 * 60);
 const EPG_TTL: Duration = Duration::from_secs(15 * 60);
+/// Account/platform playability changes when packs change; probe it rarely.
+const PLAYABLE_TTL: Duration = Duration::from_secs(30 * 60);
 /// Stop beating once no media or license request has touched the playback for
 /// this long. Matches the playback TTL so an idle session is never resumed from
 /// a cache entry that has already expired.
@@ -105,6 +107,10 @@ pub struct TataplayState {
     /// Guide days keyed by IST midnight. Shared by XMLTV generation and the
     /// per-channel web guide so one day is fetched once.
     epg_cache: RwLock<HashMap<i64, (Vec<GuideChannel>, Instant)>>,
+    /// Channels this account can actually play, from the channel detail page.
+    /// Kept separately from the guide so pack changes expire without refetching
+    /// every programme row.
+    playable: RwLock<HashMap<String, (bool, Instant)>>,
     /// Last media/license access, so the heartbeat can stop when playback ends.
     last_activity: Arc<Mutex<Instant>>,
     /// When a session close was attempted, so a 130402 retry can be limited to
@@ -132,6 +138,7 @@ impl TataplayState {
             intent: Mutex::new(None),
             tune: tokio::sync::Mutex::new(()),
             epg_cache: RwLock::new(HashMap::new()),
+            playable: RwLock::new(HashMap::new()),
             last_activity: Arc::new(Mutex::new(Instant::now())),
             last_close: Mutex::new(None),
             heartbeat: Mutex::new(None),
@@ -204,6 +211,7 @@ impl TataplayState {
         *self.keys.write().unwrap() = None;
         self.resolved.write().unwrap().clear();
         self.epg_cache.write().unwrap().clear();
+        self.playable.write().unwrap().clear();
     }
 
     pub async fn logout(&self, store: &crate::store::Store) -> anyhow::Result<()> {
@@ -269,6 +277,85 @@ impl TataplayState {
     /// Returns whether a fresh catalogue is available. A failed fetch leaves
     /// the previous generation dropped rather than serving another account's
     /// list, and the caller can report the upstream failure.
+    /// Drop channels the account cannot play on this server's clients.
+    /// Playability is cached per channel; a probe failure keeps the channel
+    /// visible rather than hiding it on a transient error.
+    async fn filter_playable(&self, client: &Arc<Client>, channels: Vec<Channel>) -> Vec<Channel> {
+        let now = Instant::now();
+        let mut slots: Vec<Option<Channel>> = Vec::with_capacity(channels.len());
+        let mut pending: Vec<(usize, String, String)> = Vec::new();
+        {
+            let mut cache = self.playable.write().unwrap();
+            cache.retain(|_, (_, at)| at.elapsed() < PLAYABLE_TTL);
+            for (index, channel) in channels.into_iter().enumerate() {
+                match cache.get(&channel.id) {
+                    Some((true, _)) => slots.push(Some(channel)),
+                    Some((false, _)) => slots.push(None),
+                    None => {
+                        let document = document_id(&channel.id).unwrap_or_default().to_string();
+                        pending.push((index, channel.id.clone(), document));
+                        slots.push(Some(channel));
+                    }
+                }
+            }
+        }
+        if pending.is_empty() {
+            return slots.into_iter().flatten().collect();
+        }
+        let total = pending.len();
+        let mut fetches = tokio::task::JoinSet::new();
+        let mut iter = pending.into_iter();
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(25);
+        let mut outcomes: Vec<(usize, String, Option<bool>)> = Vec::with_capacity(total);
+        loop {
+            while fetches.len() < 8 {
+                let Some((index, channel_id, document)) = iter.next() else {
+                    break;
+                };
+                let client = client.clone();
+                fetches.spawn(async move {
+                    let playable = client.channel_playable(&document).await.ok().flatten();
+                    (index, channel_id, playable)
+                });
+            }
+            if fetches.is_empty() {
+                break;
+            }
+            let left = deadline.saturating_duration_since(tokio::time::Instant::now());
+            if left.is_zero() {
+                fetches.abort_all();
+                break;
+            }
+            match tokio::time::timeout(left, fetches.join_next()).await {
+                Ok(Some(Ok(outcome))) => outcomes.push(outcome),
+                Ok(Some(_)) => {}
+                Ok(None) => break,
+                Err(_) => {
+                    fetches.abort_all();
+                    break;
+                }
+            }
+        }
+        let mut hidden = 0usize;
+        let mut cache = self.playable.write().unwrap();
+        for (index, channel_id, playable) in outcomes {
+            if let Some(playable) = playable {
+                cache.insert(channel_id, (playable, now));
+                if !playable {
+                    slots[index] = None;
+                    hidden += 1;
+                }
+            }
+        }
+        tracing::info!(
+            probed = total,
+            hidden,
+            playable = slots.iter().filter(|slot| slot.is_some()).count(),
+            "tataplay playability scan"
+        );
+        slots.into_iter().flatten().collect()
+    }
+
     pub async fn ensure_catalogue(&self) -> bool {
         if !self.connected() {
             return false;
@@ -315,6 +402,7 @@ impl TataplayState {
         };
         match client.catalogue().await {
             Ok(channels) => {
+                let channels = self.filter_playable(&client, channels).await;
                 let now = Instant::now();
                 self.commit_if_current(generation, || {
                     *self.catalogue.write().unwrap() = channels;
@@ -1082,6 +1170,68 @@ mod tests {
         assert_eq!(channels[0].id, "tp_1918");
         assert_eq!(channels[0].logo_url, "a.png");
         assert!(channels[1].is_catchup_available);
+    }
+
+    #[tokio::test]
+    async fn catalogue_hides_channels_the_account_cannot_play() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/lit-mobile-common-bff/api/v2/channels/guide"))
+            .and(header("sid", "sid-1"))
+            .and(query_param("limit", "600"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "data": {"total": 2, "channelList": [
+                    {"id": 1918, "title": "Star Plus", "channelNumber": "115",
+                     "entitlements": ["held"]},
+                    {"id": 1928, "title": "Star Utsav", "channelNumber": "116",
+                     "entitlements": ["held"]}
+                ]}
+            })))
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path(
+                "/lit-subscription-service/api/v1/lit/getEntitlementDetails",
+            ))
+            .and(query_param("forceRefresh", "true"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "data": {"entitlements": ["held"]}
+            })))
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/content-detail/pub/api/v1/lit/ls/channel/1918"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "data": {"channelMeta": {
+                    "playableOnMobile": true,
+                    "playableOnBrowsers": true
+                }}
+            })))
+            .expect(1)
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/content-detail/pub/api/v1/lit/ls/channel/1928"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "data": {"channelMeta": {
+                    "playableOnMobile": false,
+                    "playableOnBrowsers": false
+                }}
+            })))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let state = TataplayState::new(true);
+        state.set_client_for_test(client_for(&server));
+        assert!(state.ensure_catalogue().await);
+        assert!(state.contains("tp_1918"));
+        assert!(!state.contains("tp_1928"));
+        assert_eq!(state.channels().len(), 1);
+
+        // The catalogue TTL serves the filtered set without another probe.
+        assert!(state.ensure_catalogue().await);
+        server.verify().await;
     }
 
     #[tokio::test]
