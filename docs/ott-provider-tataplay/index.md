@@ -118,11 +118,24 @@ guide serves `/epg/<id>/<offset>` from the same cached days.
 
 The proxy also rewrites the live MPD with `suggestedPresentationDelay="PT24S"`
 because the origin's SegmentTimeline trails its own clock by a couple of
-segments; without it Shaka asks for unpublished segments and loops. A real
-Widevine challenge spends the playback token, so a `130601` answer is retried
-once with a fresh session and token, while `130402 Too many concurrent streams
-for device type` is returned as-is because another session already holds the
-account's single slot.
+segments; without it Shaka asks for unpublished segments and loops.
+
+Widevine needs more than the init segment's PSSH. The samples carry a CENC
+`seig` sample group whose key id is the one the CDM actually decrypts with, and
+it can differ from the init segment's `tenc` default key. The proxy probes the
+newest small audio segment for that key id, merges it with the init PSSH key
+ids, and injects one `cenc:pssh` into every AdaptationSet. Players then ask for
+every key in a single challenge instead of one licence per rendition.
+
+A real Widevine challenge spends the playback token, so a `130601` answer is
+retried once with a fresh session and token, while `130402 Too many concurrent
+streams for device type` is resent once after a short wait because a channel
+switch frees the previous slot asynchronously.
+
+The concurrency session's `POST`/`DELETE` must carry an OkHttp user agent
+(`okhttp/4.12.0`). Without it Akamai answers `403 Access Denied`, the heartbeat
+never starts, and the CDN freezes the live manifest at its first `publishTime`.
+
 
 ### Known gaps
 

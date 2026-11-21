@@ -40,6 +40,40 @@ struct Heartbeat {
     task: tokio::task::JoinHandle<()>,
 }
 
+/// One license endpoint and the credentials that authorise it. Both values
+/// always come from the same `ResolvedPlayback`: the URL is signed for the
+/// playback session the token belongs to, so mixing a URL from one resolution
+/// with a token from another is refused upstream (`130001`/`130601`).
+#[derive(Clone, Debug)]
+pub struct LicenseSession {
+    pub url: String,
+    pub headers: Vec<(String, String)>,
+    pub session_id: String,
+}
+
+impl LicenseSession {
+    fn from_playback(resolved: &ResolvedPlayback) -> Option<LicenseSession> {
+        if resolved.license_url.is_empty() {
+            return None;
+        }
+        let mut headers = resolved.license_headers.clone();
+        // Irdeto denies the Widevine challenge as `[__anonymous]` without the
+        // playback token from `tokenInfo`.
+        headers.retain(|(name, _)| !name.eq_ignore_ascii_case("authorization"));
+        if !resolved.license_token.is_empty() {
+            headers.push((
+                "Authorization".to_string(),
+                format!("Bearer {}", resolved.license_token),
+            ));
+        }
+        Some(LicenseSession {
+            url: resolved.license_url.clone(),
+            headers,
+            session_id: resolved.session_id.clone(),
+        })
+    }
+}
+
 pub struct TataplayState {
     config_enabled: bool,
     client: RwLock<Option<Arc<Client>>>,
@@ -405,10 +439,33 @@ impl TataplayState {
         Some(keys)
     }
 
+    /// Whether the heartbeat slot is held by this document's session.
+    ///
+    /// A cached `ResolvedPlayback` is only usable while its concurrency
+    /// session is the one the account is beating. Switching away closes that
+    /// session, so a cache hit after switching back must resolve a fresh one
+    /// instead of replaying a session the upstream has already freed.
+    fn session_is_active(&self, document: &str, resolved: &ResolvedPlayback) -> bool {
+        if resolved.session_id.is_empty() {
+            return true;
+        }
+        let slot = self.heartbeat.lock().unwrap();
+        slot.as_ref().is_some_and(|running| {
+            running.document == document && running.session_id == resolved.session_id
+        })
+    }
+
+    /// The document whose session currently owns the account's single
+    /// concurrency slot.
+    pub fn active_document(&self) -> Option<String> {
+        let slot = self.heartbeat.lock().unwrap();
+        slot.as_ref().map(|running| running.document.clone())
+    }
+
     async fn ensure_playback(&self, document: &str) -> Option<ResolvedPlayback> {
         *self.last_activity.lock().unwrap() = Instant::now();
         if let Some((resolved, at)) = self.resolved.read().unwrap().get(document) {
-            if at.elapsed() < PLAYBACK_TTL {
+            if at.elapsed() < PLAYBACK_TTL && self.session_is_active(document, resolved) {
                 return Some(resolved.clone());
             }
         }
@@ -423,7 +480,7 @@ impl TataplayState {
             return None;
         }
         if let Some((resolved, at)) = self.resolved.read().unwrap().get(document) {
-            if at.elapsed() < PLAYBACK_TTL {
+            if at.elapsed() < PLAYBACK_TTL && self.session_is_active(document, resolved) {
                 return Some(resolved.clone());
             }
         }
@@ -623,10 +680,36 @@ impl TataplayState {
     /// playback token. Used when Irdeto refuses a challenge with `130601`
     /// after the first licence, because the token is consumed by that one
     /// challenge.
-    pub async fn refresh_license(&self, channel_id: &str) -> anyhow::Result<(String, String)> {
+    ///
+    /// `stale_session_id` is the session the refused challenge used. If
+    /// another license request already rotated this channel to a newer
+    /// session while this one waited for the lock, that newer session is
+    /// returned as-is: rotating again would close the session the other
+    /// request just handed to its player.
+    pub async fn refresh_license(
+        &self,
+        channel_id: &str,
+        stale_session_id: &str,
+    ) -> anyhow::Result<LicenseSession> {
         let document = document_id(channel_id)
             .ok_or_else(|| anyhow::anyhow!("tataplay: not a tataplay channel"))?;
         let _guard = self.locks.lock(&format!("license:{document}")).await;
+
+        if let Some((resolved, _)) = self.resolved.read().unwrap().get(document) {
+            if !resolved.session_id.is_empty() && resolved.session_id != stale_session_id {
+                return LicenseSession::from_playback(resolved)
+                    .ok_or_else(|| anyhow::anyhow!("tataplay: playback carries no license URL"));
+            }
+        }
+
+        // A late retry for a channel that no longer owns the account's single
+        // slot must not close the session the account is using now.
+        if let Some(active) = self.active_document() {
+            if active != document {
+                anyhow::bail!("tataplay: channel {channel_id} is not the active playback");
+            }
+        }
+
         let client = self
             .client()
             .ok_or_else(|| anyhow::anyhow!("tataplay: not connected"))?;
@@ -638,33 +721,62 @@ impl TataplayState {
         // already registered before asking for another, or the license
         // endpoint answers `130402 Too many concurrent streams`.
         self.stop_heartbeat_and_wait().await;
-        let resolved = client.play(document, &keys).await?;
-        self.resolved.write().unwrap().insert(
-            document.to_string(),
-            (resolved.clone(), Instant::now()),
-        );
+
+        // The upstream can still see the session just closed for a moment.
+        // Retry the access-control call briefly rather than failing the
+        // player's only retry on that race.
+        let mut resolved = None;
+        let mut last_error = None;
+        for attempt in 0..3u32 {
+            match client.play(document, &keys).await {
+                Ok(playback) => {
+                    resolved = Some(playback);
+                    break;
+                }
+                Err(error) => {
+                    let message = error.to_string();
+                    let slot_busy = message.contains("130402")
+                        || message.to_ascii_lowercase().contains("concurrent");
+                    last_error = Some(error);
+                    if !slot_busy || attempt == 2 {
+                        break;
+                    }
+                    tokio::time::sleep(Duration::from_millis(300 * u64::from(attempt + 1))).await;
+                }
+            }
+        }
+        let resolved = resolved.ok_or_else(|| {
+            last_error
+                .unwrap_or_else(|| anyhow::anyhow!("tataplay: playback could not be resolved"))
+        })?;
+        self.resolved
+            .write()
+            .unwrap()
+            .insert(document.to_string(), (resolved.clone(), Instant::now()));
         self.start_heartbeat(&client, document, &resolved);
-        Ok((resolved.license_url, resolved.license_token))
+        LicenseSession::from_playback(&resolved)
+            .ok_or_else(|| anyhow::anyhow!("tataplay: playback carries no license URL"))
     }
 
-    pub async fn license_headers(&self, channel_id: &str) -> Vec<(String, String)> {
-        let Some(document) = document_id(channel_id) else {
-            return Vec::new();
-        };
-        match self.ensure_playback(document).await {
-            Some(mut resolved) => {
-                // Irdeto denies the Widevine challenge as `[__anonymous]`
-                // without the playback token from `tokenInfo`.
-                if !resolved.license_token.is_empty() {
-                    resolved.license_headers.push((
-                        "Authorization".to_string(),
-                        format!("Bearer {}", resolved.license_token),
-                    ));
-                }
-                resolved.license_headers
+    /// The active license URL and the credentials that authorise it, taken
+    /// from one `ResolvedPlayback` snapshot. A license request for a channel
+    /// that no longer owns the playback slot is refused instead of borrowing
+    /// the active channel's session.
+    pub async fn license_session(&self, channel_id: &str) -> anyhow::Result<LicenseSession> {
+        let document = document_id(channel_id)
+            .ok_or_else(|| anyhow::anyhow!("tataplay: not a tataplay channel"))?;
+        let _guard = self.locks.lock(&format!("license:{document}")).await;
+        if let Some(active) = self.active_document() {
+            if active != document {
+                anyhow::bail!("tataplay: channel {channel_id} is not the active playback");
             }
-            None => Vec::new(),
         }
+        let resolved = self
+            .ensure_playback(document)
+            .await
+            .ok_or_else(|| anyhow::anyhow!("tataplay: playback could not be resolved"))?;
+        LicenseSession::from_playback(&resolved)
+            .ok_or_else(|| anyhow::anyhow!("tataplay: playback carries no license URL"))
     }
 
     pub fn playlist_ready(&self, channel_id: &str) -> bool {
@@ -780,13 +892,156 @@ mod tests {
         assert_eq!(live.result, "OK");
         assert_eq!(live.mpd.auto, "not-encrypted");
         assert!(live.is_drm);
-        let headers = state.license_headers("tp_1918").await;
+        let session = state.license_session("tp_1918").await.unwrap();
+        assert_eq!(session.url, "not-encrypted");
+        assert_eq!(session.session_id, "sess-1");
         assert!(
-            headers
+            session
+                .headers
                 .iter()
-                .any(|(name, value)| name == "Authorization"
-                    && value == "Bearer playback-token"),
-            "the Irdeto challenge must carry the playback token: {headers:?}"
+                .any(|(name, value)| name == "Authorization" && value == "Bearer playback-token"),
+            "the Irdeto challenge must carry the playback token: {:?}",
+            session.headers
+        );
+    }
+
+    /// Refreshing a spent license token must hand the caller the new URL and
+    /// the new token together, and a later stale retry must reuse that
+    /// session instead of rotating it again.
+    #[tokio::test]
+    async fn refresh_returns_one_session_url_and_token_and_reuses_it() {
+        use std::sync::atomic::AtomicUsize;
+
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/lit-ls-config/pub/api/v1/config"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "data": {"app": {"dd": {"v1": "ZG5INSxTMSVDbSN1cFclZQ==", "v2": "YWVzRW5jcnlwdGlvbktleQ=="}}}
+            })))
+            .mount(&server)
+            .await;
+        let plays = Arc::new(AtomicUsize::new(0));
+        let plays_for_response = plays.clone();
+        let base = server.uri();
+        let base_for_response = base.clone();
+        Mock::given(method("GET"))
+            .and(path("/pas/api/v1/access/control/LIVE/1918"))
+            .respond_with(move |_request: &wiremock::Request| {
+                let call = plays_for_response.fetch_add(1, Ordering::SeqCst);
+                let (session, token) = if call == 0 {
+                    ("sess-a", "token-a")
+                } else {
+                    ("sess-b", "token-b")
+                };
+                ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                    "data": {
+                        "sessionId": session,
+                        "heartbeatInterval": 3600,
+                        "tokenInfo": {"token": token},
+                        "playbackUrls": {
+                            "dashWidewinePlayUrl": "not-encrypted",
+                            "dashWidewineLicenseUrl": format!("{base_for_response}/license/{session}")
+                        }
+                    }
+                }))
+            })
+            .expect(2)
+            .mount(&server)
+            .await;
+        Mock::given(method("POST"))
+            .and(path("/smgs/api/v1/session"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({"code": 0})))
+            .mount(&server)
+            .await;
+        Mock::given(method("DELETE"))
+            .and(path("/smgs/api/v1/session"))
+            .and(header("x-session-id", "sess-a"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({"code": 0})))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let state = TataplayState::new(true);
+        state.set_client_for_test(client_for(&server));
+        state.live("tp_1918").await.unwrap();
+
+        let first = state.license_session("tp_1918").await.unwrap();
+        assert_eq!(first.url, format!("{base}/license/sess-a"));
+        assert!(first
+            .headers
+            .iter()
+            .any(|(name, value)| name == "Authorization" && value == "Bearer token-a"));
+
+        let fresh = state
+            .refresh_license("tp_1918", &first.session_id)
+            .await
+            .unwrap();
+        assert_eq!(fresh.session_id, "sess-b");
+        assert_eq!(
+            fresh.url,
+            format!("{base}/license/sess-b"),
+            "the refreshed URL must not be paired with the spent token"
+        );
+        assert!(
+            fresh
+                .headers
+                .iter()
+                .any(|(name, value)| name == "Authorization" && value == "Bearer token-b"),
+            "the refreshed session must carry its own token: {:?}",
+            fresh.headers
+        );
+
+        // A second, delayed 130601 retry that still names session A must reuse
+        // B rather than closing it and opening another session.
+        let reused = state.refresh_license("tp_1918", "sess-a").await.unwrap();
+        assert_eq!(reused.session_id, "sess-b");
+        assert_eq!(reused.url, fresh.url);
+        assert_eq!(plays.load(Ordering::SeqCst), 2);
+        server.verify().await;
+    }
+
+    /// A license request for the channel that was playing before a switch
+    /// must not take the slot or close the channel that owns it now.
+    #[tokio::test]
+    async fn stale_license_request_cannot_steal_the_active_channel() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/smgs/api/v1/session"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({"code": 0})))
+            .mount(&server)
+            .await;
+
+        let state = TataplayState::new(true);
+        let client = client_for(&server);
+        state.set_client_for_test(client.clone());
+        let active = ResolvedPlayback {
+            session_id: "sess-live".into(),
+            heartbeat_interval: Some(3600),
+            ..ResolvedPlayback::default()
+        };
+        state.start_heartbeat(&client, "tp_1", &active);
+        wait_for(&server, "POST", "/smgs/api/v1/session").await;
+
+        let error = state.license_session("tp_2").await.unwrap_err().to_string();
+        assert!(error.contains("not the active playback"), "{error}");
+        let error = state
+            .refresh_license("tp_2", "sess-stale")
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("not the active playback"), "{error}");
+
+        assert_eq!(state.active_document().as_deref(), Some("tp_1"));
+        assert_eq!(
+            server
+                .received_requests()
+                .await
+                .unwrap()
+                .iter()
+                .filter(|request| request.method.as_str() == "DELETE")
+                .count(),
+            0,
+            "a stale license retry must not end the active session"
         );
     }
 

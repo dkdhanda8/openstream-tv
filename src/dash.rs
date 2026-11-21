@@ -15,6 +15,8 @@ use axum::body::{Body, Bytes};
 use axum::extract::{Query, State};
 use axum::http::{header, Method, StatusCode};
 use axum::response::{IntoResponse, Redirect, Response};
+#[cfg(feature = "beta")]
+use base64::Engine as _;
 use std::sync::{Arc, Mutex, RwLock};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
@@ -70,10 +72,21 @@ pub struct DrmMpdOutput {
 pub struct DashState {
     drm_mpd_cache: RwLock<std::collections::HashMap<String, (DrmMpdOutput, Instant, u64)>>,
     live_cache: RwLock<std::collections::HashMap<String, (LiveUrlOutput, Instant, u64)>>,
+    /// Merged Widevine PSSH per Tata Play channel, so one EME session can ask
+    /// for every rendition's key in a single challenge.
+    #[cfg(feature = "beta")]
+    tataplay_pssh: RwLock<std::collections::HashMap<String, (String, Instant)>>,
     /// Coalesces concurrent live-cache misses for the same channel.
     live_locks: crate::keyed_locks::KeyedLocks,
     cdn_clock: Mutex<Option<(SystemTime, Instant)>>,
 }
+
+#[cfg(feature = "beta")]
+const TATAPLAY_PSSH_TTL: Duration = Duration::from_secs(10 * 60);
+#[cfg(feature = "beta")]
+const WIDEVINE_SYSTEM_ID: [u8; 16] = [
+    0xed, 0xef, 0x8b, 0xa9, 0x79, 0xd6, 0x4a, 0xce, 0xa3, 0xc8, 0x27, 0xdc, 0xd5, 0x1d, 0x21, 0xed,
+];
 
 impl DashState {
     /// Served only in the context epoch it was built in, so a hit racing an
@@ -142,9 +155,26 @@ impl DashState {
         Some(t + at.elapsed())
     }
 
+    #[cfg(feature = "beta")]
+    fn get_tataplay_pssh(&self, channel_id: &str) -> Option<String> {
+        let map = self.tataplay_pssh.read().unwrap();
+        let (value, at) = map.get(channel_id)?;
+        (at.elapsed() <= TATAPLAY_PSSH_TTL).then(|| value.clone())
+    }
+
+    #[cfg(feature = "beta")]
+    fn set_tataplay_pssh(&self, channel_id: &str, value: String) {
+        self.tataplay_pssh
+            .write()
+            .unwrap()
+            .insert(channel_id.to_string(), (value, Instant::now()));
+    }
+
     pub fn clear(&self) {
         self.drm_mpd_cache.write().unwrap().clear();
         self.live_cache.write().unwrap().clear();
+        #[cfg(feature = "beta")]
+        self.tataplay_pssh.write().unwrap().clear();
         *self.cdn_clock.lock().unwrap() = None;
     }
 }
@@ -509,10 +539,28 @@ async fn drm_license_impl(
     }
 
     // Tata Play's license request carries the subscriber token and device
-    // identity that authorised the playback session.
+    // identity that authorised the playback session. The URL and the bearer
+    // token must come from the same resolved session: the route's URL was
+    // minted when the manifest was served and may belong to an older session
+    // by the time the player sends its challenge.
     #[cfg(feature = "beta")]
     if crate::tataplay::is_tataplay_channel(&channel_id) {
-        tracing::debug!(channel = %channel_id, url = %decoded_url, "tataplay license upstream");
+        let session = match state.tataplay.license_session(&channel_id).await {
+            Ok(session) => session,
+            Err(error) => {
+                tracing::debug!(
+                    channel = %channel_id,
+                    %error,
+                    "tataplay license session unavailable"
+                );
+                return (StatusCode::CONFLICT, error.to_string()).into_response();
+            }
+        };
+        tracing::debug!(
+            channel = %channel_id,
+            url = %session.url,
+            "tataplay license upstream"
+        );
         let build = |url: &str, headers: &[(String, String)]| {
             let mut req = state
                 .http
@@ -523,30 +571,34 @@ async fn drm_license_impl(
             }
             req
         };
-        let headers = state.tataplay.license_headers(&channel_id).await;
-        let first = send_license_parts(build(&decoded_url, &headers), body.clone()).await;
-        // `130402` means the account is already at its stream limit; opening
-        // another session makes that worse, so only a spent token is retried.
-        let spent_token = first.0 == StatusCode::FORBIDDEN
-            && String::from_utf8_lossy(&first.1).contains("\"code\":130601");
-        if spent_token {
+        let send = |url: &str, headers: &[(String, String)], body: Bytes| {
+            send_license_parts(build(url, headers), body)
+        };
+        let mut first = send(&session.url, &session.headers, body.clone()).await;
+        // Closing the previous channel's session frees the account's single
+        // slot asynchronously. A switch can therefore see `130402` for a
+        // moment; resend the same challenge after a short wait. This is not a
+        // new session, so a genuinely occupied account still refuses it.
+        if !first.0.is_success() && license_error_code(&first.1) == Some(130402) {
+            tokio::time::sleep(Duration::from_millis(700)).await;
+            first = send(&session.url, &session.headers, body.clone()).await;
+        }
+        if !first.0.is_success() && license_error_code(&first.1) == Some(130601) {
             // Irdeto consumes the playback token with the first challenge.
             // Shaka and ExoPlayer request audio and video keys separately, so
             // the second challenge is refused `130601`. Resolve a fresh
             // session and retry that challenge once.
-            if let Ok((license_url, token)) = state.tataplay.refresh_license(&channel_id).await {
+            if let Ok(fresh) = state
+                .tataplay
+                .refresh_license(&channel_id, &session.session_id)
+                .await
+            {
                 tracing::debug!(
                     channel = %channel_id,
-                    url = %license_url,
+                    url = %fresh.url,
                     "retrying tataplay license with a fresh token"
                 );
-                let mut retry_headers = headers;
-                retry_headers
-                    .retain(|(name, _)| !name.eq_ignore_ascii_case("authorization"));
-                retry_headers.push(("Authorization".into(), format!("Bearer {token}")));
-                return license_response(
-                    send_license_parts(build(&license_url, &retry_headers), body).await,
-                );
+                return license_response(send(&fresh.url, &fresh.headers, body).await);
             }
         }
         return license_response(first);
@@ -689,6 +741,21 @@ async fn send_airtel_license_request(
     }
 }
 
+/// The Irdeto business code from a refused license challenge, if the body is
+/// its JSON envelope (`{"code":130601,...}`). `130601` means the playback
+/// token that signed the challenge was already spent; `130402` means the
+/// account is at its concurrency limit and must not be retried with another
+/// session.
+#[cfg(feature = "beta")]
+fn license_error_code(body: &[u8]) -> Option<i64> {
+    let value: serde_json::Value = serde_json::from_slice(body).ok()?;
+    match value.get("code")? {
+        serde_json::Value::Number(number) => number.as_i64(),
+        serde_json::Value::String(text) => text.trim().parse().ok(),
+        _ => None,
+    }
+}
+
 async fn send_license_parts(
     req: reqwest::RequestBuilder,
     body: Bytes,
@@ -760,6 +827,476 @@ pub struct RenderMpdQuery {
     channel_id: Option<String>,
     q: Option<String>,
     hdnea: Option<String>,
+}
+
+/// Tata Play's DASH manifest advertises Widevine without any `cenc:pssh`, so
+/// each player derives its init data from an individual track's init segment.
+/// Every rendition uses its own key id, and Irdeto's playback token authorises
+/// exactly one challenge: a player that asks per track is refused `130601` on
+/// the second one.
+///
+/// Collect every rendition's key id from the init segments, then publish one
+/// Widevine PSSH listing all of them. A player that trusts the manifest asks
+/// for every key in a single challenge, which is how the provider's own app
+/// streams the channel.
+#[cfg(feature = "beta")]
+async fn tataplay_mpd_pssh(
+    state: &Arc<AppState>,
+    channel_id: &str,
+    mpd_url: &str,
+    body: &str,
+) -> Option<String> {
+    if body.contains("<cenc:pssh") {
+        return None;
+    }
+    if let Some(cached) = state.dash_state.get_tataplay_pssh(channel_id) {
+        return Some(cached);
+    }
+    let urls = tataplay_init_urls(mpd_url, body);
+    if urls.is_empty() {
+        return None;
+    }
+    // The samples themselves can name a different key than the init segment's
+    // `tenc`/PSSH (`seig` sample groups). That key is the one the CDM actually
+    // needs, so probe one small media segment for its key id too.
+    let mut urls = urls;
+    urls.extend(tataplay_media_probe_urls(mpd_url, body));
+    let mut fetches = tokio::task::JoinSet::new();
+    for url in urls {
+        let http = state.http.clone();
+        fetches.spawn(async move {
+            let response = http
+                .get(&url)
+                .timeout(Duration::from_secs(8))
+                .send()
+                .await
+                .ok()?;
+            response.bytes().await.ok()
+        });
+    }
+    let mut kids: Vec<[u8; 16]> = Vec::new();
+    let mut seig_found = false;
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+    loop {
+        let left = deadline.saturating_duration_since(tokio::time::Instant::now());
+        if left.is_zero() {
+            fetches.abort_all();
+            break;
+        }
+        match tokio::time::timeout(left, fetches.join_next()).await {
+            Ok(Some(Ok(Some(bytes)))) => {
+                pssh_key_ids(&bytes, &mut kids);
+                let before = kids.len();
+                seig_key_ids(&bytes, &mut kids);
+                seig_found |= kids.len() > before;
+            }
+            Ok(Some(_)) => {}
+            Ok(None) => break,
+            Err(_) => {
+                fetches.abort_all();
+                break;
+            }
+        }
+    }
+    if kids.is_empty() || !seig_found {
+        // Without the sample group's key the merged PSSH would ask for keys
+        // that do not decrypt the media; fall back to the in-band PSSH instead.
+        return None;
+    }
+    let pssh = merged_widevine_pssh(&kids);
+    state.dash_state.set_tataplay_pssh(channel_id, pssh.clone());
+    Some(pssh)
+}
+
+/// Absolute URLs for every `Representation`'s init segment in the origin
+/// manifest. Tata Play uses one `BaseURL` for the MPD and a `SegmentTemplate`
+/// per adaptation set; the MPD's `hdnea` query is reused for the fetches.
+#[cfg(feature = "beta")]
+fn tataplay_init_urls(mpd_url: &str, body: &str) -> Vec<String> {
+    let Ok(base) = url::Url::parse(mpd_url) else {
+        return Vec::new();
+    };
+    let base_url = xml_tag_text(body, "BaseURL").unwrap_or("");
+    let query = base.query().map(str::to_string);
+    let mut urls = Vec::new();
+    for (tag, block) in child_blocks(body, "AdaptationSet") {
+        if !(tag.contains("contentType=\"audio\"") || tag.contains("contentType=\"video\"")) {
+            continue;
+        }
+        let Some(template) = xml_tag(block, "SegmentTemplate") else {
+            continue;
+        };
+        let Some(init) = attr_value(template, "initialization") else {
+            continue;
+        };
+        for rep in xml_tags(block, "Representation") {
+            let Some(id) = attr_value(rep, "id") else {
+                continue;
+            };
+            let init = init.replace("$RepresentationID$", id);
+            let relative = if base_url.is_empty() {
+                init
+            } else {
+                format!("{base_url}{init}")
+            };
+            let Ok(mut url) = base.join(&relative) else {
+                continue;
+            };
+            if url.query().is_none() {
+                if let Some(query) = &query {
+                    url.set_query(Some(query));
+                }
+            }
+            urls.push(url.to_string());
+        }
+    }
+    urls
+}
+
+/// The opening tag of the first `name` element, including its `>`.
+#[cfg(feature = "beta")]
+fn xml_tag<'a>(body: &'a str, name: &str) -> Option<&'a str> {
+    let start = body.find(&format!("<{name}"))?;
+    let end = start + body[start..].find('>')?;
+    Some(&body[start..=end])
+}
+
+/// The first `name` element's text content, or "" for a self-closing tag.
+#[cfg(feature = "beta")]
+fn xml_tag_text<'a>(body: &'a str, name: &str) -> Option<&'a str> {
+    let open = xml_tag(body, name)?;
+    if open.ends_with("/>") {
+        return Some("");
+    }
+    let start = body.find(open)? + open.len();
+    let close = format!("</{name}>");
+    let end = start + body[start..].find(&close)?;
+    Some(&body[start..end])
+}
+
+#[cfg(feature = "beta")]
+fn xml_tags<'a>(body: &'a str, name: &str) -> Vec<&'a str> {
+    let needle = format!("<{name}");
+    let mut tags = Vec::new();
+    let mut rest = body;
+    while let Some(start) = rest.find(&needle) {
+        let Some(end) = rest[start..].find('>') else {
+            break;
+        };
+        tags.push(&rest[start..=start + end]);
+        rest = &rest[start + end + 1..];
+    }
+    tags
+}
+
+/// Every `<name ...>...</name>` child as (opening tag, inner body), using the
+/// first matching close tag.
+#[cfg(feature = "beta")]
+fn child_blocks<'a>(body: &'a str, name: &str) -> Vec<(&'a str, &'a str)> {
+    let needle = format!("<{name}");
+    let close = format!("</{name}>");
+    let mut out = Vec::new();
+    let mut rest = body;
+    while let Some(start) = rest.find(&needle) {
+        let Some(open_end) = rest[start..].find('>') else {
+            break;
+        };
+        let after = start + open_end + 1;
+        let Some(close_rel) = rest[after..].find(&close) else {
+            break;
+        };
+        out.push((
+            &rest[start..=start + open_end],
+            &rest[after..after + close_rel],
+        ));
+        rest = &rest[after + close_rel + close.len()..];
+    }
+    out
+}
+
+#[cfg(feature = "beta")]
+fn attr_value<'a>(tag: &'a str, name: &str) -> Option<&'a str> {
+    let needle = format!("{name}=\"");
+    let start = tag.find(&needle)? + needle.len();
+    let end = start + tag[start..].find('"')?;
+    Some(&tag[start..end])
+}
+
+/// Widevine key ids from every `pssh` box in an init segment.
+#[cfg(feature = "beta")]
+fn pssh_key_ids(data: &[u8], kids: &mut Vec<[u8; 16]>) {
+    let mut at = 0;
+    while at + 32 <= data.len() {
+        let Some(pos) = data[at..].windows(4).position(|w| w == b"pssh") else {
+            break;
+        };
+        let marker = at + pos;
+        if marker < 4 {
+            at = marker + 4;
+            continue;
+        }
+        let start = marker - 4;
+        let size = u32::from_be_bytes(data[start..start + 4].try_into().unwrap()) as usize;
+        if size < 32 || start + size > data.len() {
+            at = marker + 4;
+            continue;
+        }
+        let box_bytes = &data[start..start + size];
+        if box_bytes[12..28] != WIDEVINE_SYSTEM_ID {
+            at = start + size;
+            continue;
+        }
+        let payload = &box_bytes[32..];
+        let mut i = 0;
+        while i < payload.len() {
+            let tag = payload[i];
+            i += 1;
+            let field = tag >> 3;
+            match tag & 7 {
+                0 => {
+                    while i < payload.len() && payload[i] & 0x80 != 0 {
+                        i += 1;
+                    }
+                    i += 1;
+                }
+                2 => {
+                    let Some(&len) = payload.get(i) else { break };
+                    i += 1;
+                    let len = len as usize;
+                    let Some(value) = payload.get(i..i + len) else {
+                        break;
+                    };
+                    if field == 2 && len == 16 {
+                        let mut kid = [0u8; 16];
+                        kid.copy_from_slice(value);
+                        if !kids.contains(&kid) {
+                            kids.push(kid);
+                        }
+                    }
+                    i += len;
+                }
+                5 => i += 4,
+                1 => i += 8,
+                _ => break,
+            }
+        }
+        at = start + size;
+    }
+}
+
+/// A single small media segment URL (prefer audio) so the caller can read the
+/// sample-group key id (`seig`) that the encrypted samples actually use.
+#[cfg(feature = "beta")]
+fn tataplay_media_probe_urls(mpd_url: &str, body: &str) -> Vec<String> {
+    let Ok(base) = url::Url::parse(mpd_url) else {
+        return Vec::new();
+    };
+    let base_url = xml_tag_text(body, "BaseURL").unwrap_or("");
+    let query = base.query().map(str::to_string);
+    let mut audio = None;
+    let mut video = None;
+    for (tag, block) in child_blocks(body, "AdaptationSet") {
+        let is_audio = tag.contains("contentType=\"audio\"");
+        let is_video = tag.contains("contentType=\"video\"");
+        if !is_audio && !is_video {
+            continue;
+        }
+        let Some(template) = xml_tag(block, "SegmentTemplate") else {
+            continue;
+        };
+        let Some(media) = attr_value(template, "media") else {
+            continue;
+        };
+        if !media.contains("$Number$") {
+            continue;
+        }
+        let start = attr_value(template, "startNumber")
+            .and_then(|value| value.parse::<u64>().ok())
+            .unwrap_or(0);
+        // Probe the newest segment in the timeline: the first one may still be
+        // encrypted with a rotation key from hours ago.
+        let count = xml_tag_text(block, "SegmentTimeline")
+            .map(|timeline| {
+                xml_tags(timeline, "S")
+                    .into_iter()
+                    .map(|entry| {
+                        attr_value(entry, "r")
+                            .and_then(|value| value.parse::<u64>().ok())
+                            .map(|repeat| repeat + 1)
+                            .unwrap_or(1)
+                    })
+                    .sum::<u64>()
+            })
+            .filter(|count| *count > 0)
+            .unwrap_or(1);
+        let number = start.saturating_add(count.saturating_sub(1));
+        let Some(rep) = xml_tags(block, "Representation")
+            .into_iter()
+            .min_by_key(|rep| {
+                attr_value(rep, "bandwidth")
+                    .and_then(|value| value.parse::<u64>().ok())
+                    .unwrap_or(u64::MAX)
+            })
+        else {
+            continue;
+        };
+        let Some(id) = attr_value(rep, "id") else {
+            continue;
+        };
+        let mut path = media
+            .replace("$RepresentationID$", id)
+            .replace("$Number$", &number.to_string());
+        if let Some(bandwidth) = attr_value(rep, "bandwidth") {
+            path = path.replace("$Bandwidth$", bandwidth);
+        }
+        if path.contains('$') {
+            continue;
+        }
+        let relative = if base_url.is_empty() {
+            path
+        } else {
+            format!("{base_url}{path}")
+        };
+        let Ok(mut url) = base.join(&relative) else {
+            continue;
+        };
+        if url.query().is_none() {
+            if let Some(query) = &query {
+                url.set_query(Some(query));
+            }
+        }
+        if is_audio && audio.is_none() {
+            audio = Some(url.to_string());
+        } else if is_video && video.is_none() {
+            video = Some(url.to_string());
+        }
+    }
+    audio.into_iter().chain(video).take(2).collect()
+}
+
+/// Widevine key ids from CENC `seig` sample group descriptions. These
+/// override the init segment's default key for the samples that reference
+/// them, and must be requested in the license challenge.
+#[cfg(feature = "beta")]
+fn seig_key_ids(data: &[u8], kids: &mut Vec<[u8; 16]>) {
+    let mut at = 0;
+    while at + 24 <= data.len() {
+        let Some(pos) = data[at..].windows(4).position(|w| w == b"sgpd") else {
+            break;
+        };
+        let marker = at + pos;
+        if marker < 4 {
+            at = marker + 4;
+            continue;
+        }
+        let start = marker - 4;
+        let size = u32::from_be_bytes(data[start..start + 4].try_into().unwrap()) as usize;
+        if size < 24 || start + size > data.len() {
+            at = marker + 4;
+            continue;
+        }
+        let box_bytes = &data[start..start + size];
+        let version = box_bytes[8];
+        if &box_bytes[12..16] != b"seig" {
+            at = start + size;
+            continue;
+        }
+        let default_len = u32::from_be_bytes(box_bytes[16..20].try_into().unwrap()) as usize;
+        let count = u32::from_be_bytes(box_bytes[20..24].try_into().unwrap()) as usize;
+        let mut off = 24;
+        for _ in 0..count {
+            let len = if default_len == 0 {
+                let Some(value) = box_bytes.get(off..off + 4) else {
+                    break;
+                };
+                off += 4;
+                u32::from_be_bytes(value.try_into().unwrap()) as usize
+            } else {
+                default_len
+            };
+            let Some(entry) = box_bytes.get(off..off + len) else {
+                break;
+            };
+            off += len;
+            let kid_at = if version == 1 && entry.len() >= 20 {
+                Some(4)
+            } else if entry.len() >= 18 {
+                Some(2)
+            } else {
+                None
+            };
+            if let Some(kid_at) = kid_at {
+                let mut kid = [0u8; 16];
+                kid.copy_from_slice(&entry[kid_at..kid_at + 16]);
+                if !kids.contains(&kid) {
+                    kids.push(kid);
+                }
+            }
+        }
+        at = start + size;
+    }
+}
+
+/// One Widevine PSSH v0 box whose `WidevinePsshData` lists every key id.
+#[cfg(feature = "beta")]
+fn merged_widevine_pssh(kids: &[[u8; 16]]) -> String {
+    let mut payload = Vec::with_capacity(kids.len() * 18);
+    for kid in kids {
+        payload.extend_from_slice(&[0x12, 0x10]);
+        payload.extend_from_slice(kid);
+    }
+    let size = 32 + payload.len();
+    let mut pssh = Vec::with_capacity(size);
+    pssh.extend_from_slice(&(size as u32).to_be_bytes());
+    pssh.extend_from_slice(b"pssh");
+    pssh.extend_from_slice(&[0, 0, 0, 0]);
+    pssh.extend_from_slice(&WIDEVINE_SYSTEM_ID);
+    pssh.extend_from_slice(&(payload.len() as u32).to_be_bytes());
+    pssh.extend_from_slice(&payload);
+    base64::engine::general_purpose::STANDARD.encode(pssh)
+}
+
+/// Replaces each Widevine `ContentProtection` with one that carries the merged
+/// PSSH, and declares the `cenc` namespace the child element needs.
+#[cfg(feature = "beta")]
+fn inject_widevine_pssh(body: &str, pssh: &str) -> String {
+    let mut out = String::with_capacity(body.len() + pssh.len() * 4 + 64);
+    let mut rest = body;
+    while let Some(start) = rest.find("<ContentProtection") {
+        let Some(open_end) = rest[start..].find('>') else {
+            break;
+        };
+        let end = start + open_end;
+        let tag = &rest[start..=end];
+        out.push_str(&rest[..start]);
+        if tag.contains("urn:uuid:edef8ba9-79d6-4ace-a3c8-27dcd51d21ed") {
+            if let Some(open) = tag.strip_suffix("/>") {
+                out.push_str(open);
+                out.push_str(&format!(
+                    "><cenc:pssh>{pssh}</cenc:pssh></ContentProtection>"
+                ));
+            } else {
+                out.push_str(tag);
+                out.push_str(&format!("<cenc:pssh>{pssh}</cenc:pssh>"));
+            }
+        } else {
+            out.push_str(tag);
+        }
+        rest = &rest[end + 1..];
+    }
+    out.push_str(rest);
+    if !out.contains("xmlns:cenc=") {
+        if let Some(start) = out.find("<MPD") {
+            if let Some(end) = out[start..].find('>') {
+                let mut with_ns = String::with_capacity(out.len() + 40);
+                with_ns.push_str(&out[..start + end]);
+                with_ns.push_str(" xmlns:cenc=\"urn:mpeg:cenc:2013\"");
+                with_ns.push_str(&out[start + end..]);
+                return with_ns;
+            }
+        }
+    }
+    out
 }
 
 /// `/render.mpd` — fetches the MPD, rewrites `BaseURL` to route segments
@@ -872,6 +1409,13 @@ async fn render_mpd_inner(state: Arc<AppState>, q: RenderMpdQuery) -> Response {
         if !body_str.contains("<UTCTiming") {
             let utc_timing = "<UTCTiming schemeIdUri=\"urn:mpeg:dash:utc:http-xsdate:2014\" value=\"/dashtime\"/>";
             body_str.insert_str(root_end + inserted + 1, utc_timing);
+        }
+    }
+
+    #[cfg(feature = "beta")]
+    if crate::tataplay::is_tataplay_channel(channel_id) {
+        if let Some(pssh) = tataplay_mpd_pssh(&state, channel_id, &decrypted, &body_str).await {
+            body_str = inject_widevine_pssh(&body_str, &pssh);
         }
     }
 
@@ -1277,7 +1821,6 @@ mod tests {
         assert_eq!(hdnea_cookie("token"), "hdnea=token; __hdnea__=token");
     }
 
-
     fn fastway_app_state(
         store: Arc<crate::store::Store>,
         fastway: Arc<crate::fastway_state::FastwayState>,
@@ -1403,6 +1946,336 @@ mod tests {
         assert_eq!(&body[..], b"license-response");
     }
 
+    /// A spent Irdeto token (`130601`) must be retried with the license URL
+    /// and bearer token of the *replacement* playback session, while the
+    /// player's original challenge body is forwarded unchanged. The route's
+    /// own license URL belongs to the older session and must not be reused.
+    #[cfg(feature = "beta")]
+    #[tokio::test]
+    async fn tataplay_license_retries_a_spent_token_as_one_session_pair() {
+        use crate::tataplay::{Client as TpClient, Credentials};
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use wiremock::matchers::{body_string, header, method, path};
+        use wiremock::{Mock, MockServer, Request, ResponseTemplate};
+
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/lit-ls-config/pub/api/v1/config"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "data": {"app": {"dd": {"v1": "ZG5INSxTMSVDbSN1cFclZQ==", "v2": "YWVzRW5jcnlwdGlvbktleQ=="}}}
+            })))
+            .mount(&server)
+            .await;
+        let plays = Arc::new(AtomicUsize::new(0));
+        let plays_for_response = plays.clone();
+        let base = server.uri();
+        Mock::given(method("GET"))
+            .and(path("/pas/api/v1/access/control/LIVE/1918"))
+            .respond_with(move |_request: &Request| {
+                let call = plays_for_response.fetch_add(1, Ordering::SeqCst);
+                let (session, token) = if call == 0 {
+                    ("sess-a", "token-a")
+                } else {
+                    ("sess-b", "token-b")
+                };
+                ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                    "data": {
+                        "sessionId": session,
+                        "heartbeatInterval": 3600,
+                        "tokenInfo": {"token": token},
+                        "playbackUrls": {
+                            "dashWidewinePlayUrl": "not-encrypted",
+                            "dashWidewineLicenseUrl": format!("{base}/license/{session}")
+                        }
+                    }
+                }))
+            })
+            .expect(2)
+            .mount(&server)
+            .await;
+        Mock::given(method("POST"))
+            .and(path("/license/sess-a"))
+            .and(header("authorization", "Bearer token-a"))
+            .and(body_string("widevine-challenge"))
+            .respond_with(ResponseTemplate::new(403).set_body_json(serde_json::json!({
+                "code": 130601,
+                "message": "The playback token was already used."
+            })))
+            .expect(1)
+            .mount(&server)
+            .await;
+        Mock::given(method("POST"))
+            .and(path("/license/sess-b"))
+            .and(header("authorization", "Bearer token-b"))
+            .and(body_string("widevine-challenge"))
+            .respond_with(ResponseTemplate::new(200).set_body_bytes(b"fresh-license".to_vec()))
+            .expect(1)
+            .mount(&server)
+            .await;
+        Mock::given(method("DELETE"))
+            .and(path("/smgs/api/v1/session"))
+            .and(header("x-session-id", "sess-a"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({"code": 0})))
+            .expect(1)
+            .mount(&server)
+            .await;
+        Mock::given(method("POST"))
+            .and(path("/smgs/api/v1/session"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({"code": 0})))
+            .mount(&server)
+            .await;
+
+        let tataplay = Arc::new(crate::tataplay_state::TataplayState::new(true));
+        tataplay.set_client_for_test(Arc::new(TpClient::for_test(
+            &server.uri(),
+            Credentials {
+                access_token: "access".into(),
+                refresh_token: "refresh".into(),
+                subscriber_id: "sub-1".into(),
+                sid: "sid-1".into(),
+            },
+        )));
+        let state = license_test_state_with(
+            Arc::new(crate::playbox_state::PlayboxState::new(false)),
+            tataplay,
+        );
+        // Minted for a session that no longer exists: the handler must take
+        // the URL from playback state, not from this route value.
+        let params = std::collections::HashMap::from([
+            (
+                "auth".to_string(),
+                encrypt_dash_route_value(&state.secure, "tp_1918", "http://stale.example/license"),
+            ),
+            ("channel_id".to_string(), "tp_1918".to_string()),
+        ]);
+        let response = drm_license_handler(
+            State(state),
+            Query(params),
+            Method::POST,
+            axum::http::HeaderMap::new(),
+            Bytes::from_static(b"widevine-challenge"),
+        )
+        .await;
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        assert_eq!(&body[..], b"fresh-license");
+        assert_eq!(plays.load(Ordering::SeqCst), 2);
+        server.verify().await;
+    }
+
+    /// A channel switch frees the previous slot asynchronously. A `130402`
+    /// refusal is resent once with the same session/challenge, not a new
+    /// session.
+    #[cfg(feature = "beta")]
+    #[tokio::test]
+    async fn tataplay_license_resends_once_after_a_concurrency_refusal() {
+        use crate::tataplay::{Client as TpClient, Credentials};
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use wiremock::matchers::{body_string, header, method, path};
+        use wiremock::{Mock, MockServer, Request, ResponseTemplate};
+
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/lit-ls-config/pub/api/v1/config"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "data": {"app": {"dd": {"v1": "ZG5INSxTMSVDbSN1cFclZQ==", "v2": "YWVzRW5jcnlwdGlvbktleQ=="}}}
+            })))
+            .mount(&server)
+            .await;
+        let base = server.uri();
+        Mock::given(method("GET"))
+            .and(path("/pas/api/v1/access/control/LIVE/1918"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "data": {
+                    "sessionId": "sess-a",
+                    "heartbeatInterval": 3600,
+                    "tokenInfo": {"token": "token-a"},
+                    "playbackUrls": {
+                        "dashWidewinePlayUrl": "not-encrypted",
+                        "dashWidewineLicenseUrl": format!("{base}/license/sess-a")
+                    }
+                }
+            })))
+            .mount(&server)
+            .await;
+        let attempts = Arc::new(AtomicUsize::new(0));
+        let attempts_for_response = attempts.clone();
+        Mock::given(method("POST"))
+            .and(path("/license/sess-a"))
+            .and(header("authorization", "Bearer token-a"))
+            .and(body_string("widevine-challenge"))
+            .respond_with(move |_request: &Request| {
+                if attempts_for_response.fetch_add(1, Ordering::SeqCst) == 0 {
+                    ResponseTemplate::new(403).set_body_json(serde_json::json!({
+                        "code": 130402,
+                        "message": "Too many concurrent streams for device type."
+                    }))
+                } else {
+                    ResponseTemplate::new(200).set_body_bytes(b"license-after-slot".to_vec())
+                }
+            })
+            .expect(2)
+            .mount(&server)
+            .await;
+        Mock::given(method("POST"))
+            .and(path("/smgs/api/v1/session"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({"code": 0})))
+            .mount(&server)
+            .await;
+
+        let tataplay = Arc::new(crate::tataplay_state::TataplayState::new(true));
+        tataplay.set_client_for_test(Arc::new(TpClient::for_test(
+            &server.uri(),
+            Credentials {
+                access_token: "access".into(),
+                refresh_token: "refresh".into(),
+                subscriber_id: "sub-1".into(),
+                sid: "sid-1".into(),
+            },
+        )));
+        let state = license_test_state_with(
+            Arc::new(crate::playbox_state::PlayboxState::new(false)),
+            tataplay,
+        );
+        let params = std::collections::HashMap::from([
+            (
+                "auth".to_string(),
+                encrypt_dash_route_value(&state.secure, "tp_1918", "http://stale.example/license"),
+            ),
+            ("channel_id".to_string(), "tp_1918".to_string()),
+        ]);
+        let response = drm_license_handler(
+            State(state),
+            Query(params),
+            Method::POST,
+            axum::http::HeaderMap::new(),
+            Bytes::from_static(b"widevine-challenge"),
+        )
+        .await;
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        assert_eq!(&body[..], b"license-after-slot");
+        assert_eq!(attempts.load(Ordering::SeqCst), 2);
+        server.verify().await;
+    }
+
+    #[cfg(feature = "beta")]
+    #[test]
+    fn merged_widevine_pssh_lists_every_key_id() {
+        let first = [0x11u8; 16];
+        let second = [0x22u8; 16];
+        let encoded = merged_widevine_pssh(&[first, second]);
+        let raw = base64::engine::general_purpose::STANDARD
+            .decode(&encoded)
+            .unwrap();
+        assert_eq!(&raw[4..8], b"pssh");
+        assert_eq!(&raw[12..28], &crate::dash::WIDEVINE_SYSTEM_ID);
+        let mut kids = Vec::new();
+        pssh_key_ids(&raw, &mut kids);
+        assert_eq!(kids, vec![first, second]);
+    }
+
+    #[cfg(feature = "beta")]
+    #[test]
+    fn injection_replaces_only_the_widevine_content_protection() {
+        let body = concat!(
+            "<MPD xmlns=\"urn:mpeg:dash:schema:mpd:2011\"><Period>",
+            "<AdaptationSet contentType=\"video\">",
+            "<ContentProtection value=\"cenc\" schemeIdUri=\"urn:mpeg:dash:mp4protection:2011\"/>",
+            "<ContentProtection schemeIdUri=\"urn:uuid:edef8ba9-79d6-4ace-a3c8-27dcd51d21ed\" value=\"Widevine\"/>",
+            "</AdaptationSet></Period></MPD>"
+        );
+        let out = inject_widevine_pssh(body, "AAAA");
+        assert!(out.contains("xmlns:cenc=\"urn:mpeg:cenc:2013\""));
+        assert_eq!(out.matches("<cenc:pssh>AAAA</cenc:pssh>").count(), 1);
+        assert_eq!(out.matches("mp4protection").count(), 1);
+        assert!(out.contains("</ContentProtection></AdaptationSet>"));
+    }
+
+    #[cfg(feature = "beta")]
+    #[test]
+    fn init_urls_resolve_audio_and_video_templates_only() {
+        let body = concat!(
+            "<MPD><Period><BaseURL>dash/</BaseURL>",
+            "<AdaptationSet contentType=\"audio\">",
+            "<SegmentTemplate initialization=\"$RepresentationID$.dash\" media=\"$Number$.m4s\"/>",
+            "<Representation id=\"audio_1\"/><Representation id=\"audio_2\"/>",
+            "</AdaptationSet>",
+            "<AdaptationSet contentType=\"text\">",
+            "<SegmentTemplate initialization=\"$RepresentationID$.dash\"/>",
+            "<Representation id=\"text_1\"/>",
+            "</AdaptationSet>",
+            "<AdaptationSet contentType=\"video\">",
+            "<SegmentTemplate initialization=\"$RepresentationID$.dash\" media=\"$Number$.m4s\"/>",
+            "<Representation id=\"video_1\"/>",
+            "</AdaptationSet></Period></MPD>"
+        );
+        let urls = tataplay_init_urls(
+            "https://cdn.example/live/channel/movies.mpd?hdnea=token",
+            body,
+        );
+        assert_eq!(
+            urls,
+            vec![
+                "https://cdn.example/live/channel/dash/audio_1.dash?hdnea=token",
+                "https://cdn.example/live/channel/dash/audio_2.dash?hdnea=token",
+                "https://cdn.example/live/channel/dash/video_1.dash?hdnea=token",
+            ]
+        );
+    }
+
+    #[cfg(feature = "beta")]
+    #[test]
+    fn seig_sample_group_key_is_collected_from_a_media_segment() {
+        let box_bytes = hex::decode(
+            "0000002c736770640100000073656967000000140000000100000108b4e62b2f4a0f55a69d73dadd4dde2b58",
+        )
+        .unwrap();
+        let mut kids = Vec::new();
+        seig_key_ids(&box_bytes, &mut kids);
+        assert_eq!(
+            kids,
+            vec![[
+                0xb4, 0xe6, 0x2b, 0x2f, 0x4a, 0x0f, 0x55, 0xa6, 0x9d, 0x73, 0xda, 0xdd, 0x4d, 0xde,
+                0x2b, 0x58,
+            ]]
+        );
+    }
+
+    #[cfg(feature = "beta")]
+    #[test]
+    fn media_probe_prefers_a_small_audio_segment() {
+        let body = concat!(
+            "<MPD><Period><BaseURL>dash/</BaseURL>",
+            "<AdaptationSet contentType=\"audio\">",
+            "<SegmentTemplate startNumber=\"100\" media=\"$RepresentationID$-$Number$.m4s\">",
+            "<SegmentTimeline><S t=\"0\" d=\"8\" r=\"4\"/></SegmentTimeline></SegmentTemplate>",
+            "<Representation id=\"audio_1\" bandwidth=\"80800\"/>",
+            "</AdaptationSet>",
+            "<AdaptationSet contentType=\"video\">",
+            "<SegmentTemplate startNumber=\"100\" media=\"$RepresentationID$-$Number$.m4s\">",
+            "<SegmentTimeline><S t=\"0\" d=\"8\" r=\"4\"/></SegmentTimeline></SegmentTemplate>",
+            "<Representation id=\"video_1\" bandwidth=\"4130000\"/>",
+            "</AdaptationSet></Period></MPD>"
+        );
+        assert_eq!(
+            tataplay_media_probe_urls(
+                "https://cdn.example/live/channel/movies.mpd?hdnea=token",
+                body
+            ),
+            vec![
+                "https://cdn.example/live/channel/dash/audio_1-104.m4s?hdnea=token",
+                "https://cdn.example/live/channel/dash/video_1-104.m4s?hdnea=token",
+            ]
+        );
+    }
+
     fn drm_output() -> DrmMpdOutput {
         DrmMpdOutput {
             play_url: "/render.mpd?x".into(),
@@ -1412,6 +2285,17 @@ mod tests {
 
     #[cfg(feature = "beta")]
     fn license_test_state(playbox: Arc<crate::playbox_state::PlayboxState>) -> Arc<AppState> {
+        license_test_state_with(
+            playbox,
+            Arc::new(crate::tataplay_state::TataplayState::new(false)),
+        )
+    }
+
+    #[cfg(feature = "beta")]
+    fn license_test_state_with(
+        playbox: Arc<crate::playbox_state::PlayboxState>,
+        tataplay: Arc<crate::tataplay_state::TataplayState>,
+    ) -> Arc<AppState> {
         let dir = tempfile::tempdir().unwrap();
         let store = Arc::new(crate::store::Store::open(dir.path().to_str().unwrap()).unwrap());
         std::mem::forget(dir);
@@ -1431,7 +2315,7 @@ mod tests {
             extras: Arc::new(crate::extras_state::ExtrasState::new(false, None)),
             fastway: Arc::new(crate::fastway_state::FastwayState::new(false)),
             playbox,
-            tataplay: Arc::new(crate::tataplay_state::TataplayState::new(false)),
+            tataplay,
             vzy: Arc::new(crate::vzy_state::VzyState::new(false)),
             airtel: Arc::new(crate::airtel_state::AirtelState::new(false)),
             vod_state: Default::default(),

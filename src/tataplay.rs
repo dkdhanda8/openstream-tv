@@ -766,6 +766,7 @@ impl Client {
             .http
             .request(method, self.url("smgs/api/v1/session"))
             .header(reqwest::header::CONTENT_TYPE, "application/json")
+            .header(reqwest::header::USER_AGENT, "okhttp/4.12.0")
             .header(reqwest::header::AUTHORIZATION, self.auth()?)
             .header("x-subscriber-id", &credentials.sid)
             .header("x-authenticated-userid", &credentials.sid)
