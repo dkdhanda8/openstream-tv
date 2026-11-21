@@ -234,6 +234,16 @@ impl RenderCaches {
 }
 
 pub(crate) fn extract_hdnea_from_url(u: &str) -> Option<String> {
+    // Parse the whole query: a literal `?` is valid inside a query value and
+    // must not truncate the `hdnea` parameter that follows it.
+    if let Ok(parsed) = url::Url::parse(u) {
+        for (key, value) in parsed.query_pairs() {
+            if key == "hdnea" || key == "__hdnea__" {
+                return Some(value.into_owned());
+            }
+        }
+        return None;
+    }
     let query = u.split('?').nth(1)?;
     for pair in query.split('&') {
         if let Some(v) = pair

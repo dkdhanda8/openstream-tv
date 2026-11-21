@@ -450,8 +450,9 @@ async fn channels_or_playlist(
     }
 
     let host_url = base_url(&state, &https, &prefix, &headers);
+    let log_host = host_url.split("/k/").next().unwrap_or(&host_url);
     tracing::debug!(
-        host = %host_url,
+        host = %log_host,
         user_agent = headers
             .get(axum::http::header::USER_AGENT)
             .and_then(|value| value.to_str().ok())

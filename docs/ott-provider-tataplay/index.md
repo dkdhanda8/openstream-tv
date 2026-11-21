@@ -128,9 +128,17 @@ ids, and injects one `cenc:pssh` into every AdaptationSet. Players then ask for
 every key in a single challenge instead of one licence per rendition.
 
 A real Widevine challenge spends the playback token, so a `130601` answer is
-retried once with a fresh session and token, while `130402 Too many concurrent
-streams for device type` is resent once after a short wait because a channel
-switch frees the previous slot asynchronously.
+retried once with a fresh session and token. A `130402 Too many concurrent
+streams for device type` is resent only when this server just closed a local
+session. Every deliberate tune gets a playback id; manifest and licence routes
+from an older tune are refused, including an older tune of the same channel.
+Irdeto can keep the closed channel's licence stream counted for minutes (5m41s
+in one run, about 2 minutes in another), so an immediate switch returns HTTP
+409 `Waiting for the previous stream to close`; the web player shows that
+message and a retry.
+
+The M3U licence property uses Kodi's four-field form:
+`<license-url>||R{SSM}|R`, with any `?q=` inside the URL before the pipes.
 
 The concurrency session's `POST`/`DELETE` must carry an OkHttp user agent
 (`okhttp/4.12.0`). Without it Akamai answers `403 Access Denied`, the heartbeat

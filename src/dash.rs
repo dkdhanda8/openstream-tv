@@ -82,7 +82,7 @@ pub struct DashState {
 }
 
 #[cfg(feature = "beta")]
-const TATAPLAY_PSSH_TTL: Duration = Duration::from_secs(10 * 60);
+const TATAPLAY_PSSH_TTL: Duration = Duration::from_secs(60);
 #[cfg(feature = "beta")]
 const WIDEVINE_SYSTEM_ID: [u8; 16] = [
     0xed, 0xef, 0x8b, 0xa9, 0x79, 0xd6, 0x4a, 0xce, 0xa3, 0xc8, 0x27, 0xdc, 0xd5, 0x1d, 0x21, 0xed,
@@ -156,6 +156,18 @@ impl DashState {
     }
 
     #[cfg(feature = "beta")]
+    pub fn invalidate_channel(&self, channel_id: &str) {
+        self.live_cache.write().unwrap().remove(channel_id);
+        let prefix = format!("{channel_id}_");
+        self.drm_mpd_cache
+            .write()
+            .unwrap()
+            .retain(|key, _| !key.starts_with(&prefix));
+        #[cfg(feature = "beta")]
+        self.tataplay_pssh.write().unwrap().remove(channel_id);
+    }
+
+    #[cfg(feature = "beta")]
     fn get_tataplay_pssh(&self, channel_id: &str) -> Option<String> {
         let map = self.tataplay_pssh.read().unwrap();
         let (value, at) = map.get(channel_id)?;
@@ -163,11 +175,19 @@ impl DashState {
     }
 
     #[cfg(feature = "beta")]
-    fn set_tataplay_pssh(&self, channel_id: &str, value: String) {
-        self.tataplay_pssh
-            .write()
-            .unwrap()
-            .insert(channel_id.to_string(), (value, Instant::now()));
+    fn set_tataplay_pssh(
+        &self,
+        channel_id: &str,
+        value: String,
+        epoch: u64,
+        current_epoch: impl FnOnce() -> u64,
+    ) -> bool {
+        let mut map = self.tataplay_pssh.write().unwrap();
+        if current_epoch() != epoch {
+            return false;
+        }
+        map.insert(channel_id.to_string(), (value, Instant::now()));
+        true
     }
 
     pub fn clear(&self) {
@@ -316,10 +336,16 @@ pub(crate) fn build_drm_mpd_output(
     }
 
     let channel_enc_url = encrypt_dash_route_value(&state.secure, channel_id, &tv_url);
+    let pid = if live.playback_id.is_empty() {
+        String::new()
+    } else {
+        let enc = encrypt_dash_route_value(&state.secure, channel_id, &live.playback_id);
+        format!("&pid={enc}")
+    };
     let license_url = if !live.resolved_license_url().is_empty() {
         let enc_key =
             encrypt_dash_route_value(&state.secure, channel_id, live.resolved_license_url());
-        format!("/drm?auth={enc_key}&channel_id={channel_id}&channel={channel_enc_url}")
+        format!("/drm?auth={enc_key}&channel_id={channel_id}&channel={channel_enc_url}{pid}")
     } else {
         String::new()
     };
@@ -340,7 +366,9 @@ pub(crate) fn build_drm_mpd_output(
 
     Ok(DrmMpdOutput {
         is_drm: live.is_drm,
-        play_url: format!("/render.mpd?auth={channel_enc_url}&channel_id={channel_id}&q={quality}"),
+        play_url: format!(
+            "/render.mpd?auth={channel_enc_url}&channel_id={channel_id}&q={quality}{pid}"
+        ),
         license_url,
         tv_url_host,
         tv_url_path,
@@ -385,6 +413,12 @@ async fn live_mpd_inner(
 
     if let Some(ch) = state.custom_channels.get(&channel_id) {
         return Redirect::to(&ch.url).into_response();
+    }
+
+    #[cfg(feature = "beta")]
+    if crate::tataplay::is_tataplay_channel(&channel_id) {
+        state.tataplay.tune_if_changed(&channel_id);
+        state.dash_state.invalidate_channel(&channel_id);
     }
 
     // get_drm_mpd -> fetch_live already refreshes the right credentials
@@ -446,6 +480,15 @@ pub async fn live_key_handler(
             format!("Channel {channel_id} is not available for the active account"),
         )
             .into_response();
+    }
+    #[cfg(feature = "beta")]
+    if crate::tataplay::is_tataplay_channel(&channel_id)
+        && state.tataplay.active_document().is_some()
+        && !state.tataplay.is_active_channel(&channel_id)
+    {
+        // A delayed key request for the channel the user left must not tune
+        // it back before `license_session` gets a chance to refuse it.
+        return (StatusCode::CONFLICT, "not the active playback").into_response();
     }
     let drm = match get_drm_mpd(&state, &channel_id, &quality).await {
         Ok(d) => d,
@@ -545,6 +588,15 @@ async fn drm_license_impl(
     // by the time the player sends its challenge.
     #[cfg(feature = "beta")]
     if crate::tataplay::is_tataplay_channel(&channel_id) {
+        if let Some(pid) = params
+            .get("pid")
+            .and_then(|enc| decrypt_dash_route_value(&state.secure, &channel_id, enc))
+        {
+            if !state.tataplay.playback_matches(&channel_id, &pid) {
+                tracing::debug!(channel = %channel_id, "stale tataplay license request");
+                return (StatusCode::CONFLICT, "stale playback").into_response();
+            }
+        }
         let session = match state.tataplay.license_session(&channel_id).await {
             Ok(session) => session,
             Err(error) => {
@@ -556,11 +608,7 @@ async fn drm_license_impl(
                 return (StatusCode::CONFLICT, error.to_string()).into_response();
             }
         };
-        tracing::debug!(
-            channel = %channel_id,
-            url = %session.url,
-            "tataplay license upstream"
-        );
+        tracing::debug!(channel = %channel_id, "tataplay license upstream");
         let build = |url: &str, headers: &[(String, String)]| {
             let mut req = state
                 .http
@@ -577,11 +625,21 @@ async fn drm_license_impl(
         let mut first = send(&session.url, &session.headers, body.clone()).await;
         // Closing the previous channel's session frees the account's single
         // slot asynchronously. A switch can therefore see `130402` for a
-        // moment; resend the same challenge after a short wait. This is not a
-        // new session, so a genuinely occupied account still refuses it.
-        if !first.0.is_success() && license_error_code(&first.1) == Some(130402) {
-            tokio::time::sleep(Duration::from_millis(700)).await;
+        // moment; resend the same challenge (same URL, token and body) a few
+        // times before treating it as a real stream limit.
+        let switch_race = state.tataplay.recently_closed(Duration::from_secs(10));
+        let mut attempt = 0u32;
+        while switch_race
+            && !first.0.is_success()
+            && license_error_code(&first.1) == Some(130402)
+            && attempt < 3
+        {
+            attempt += 1;
+            tokio::time::sleep(Duration::from_millis(400 * u64::from(attempt))).await;
             first = send(&session.url, &session.headers, body.clone()).await;
+        }
+        if !first.0.is_success() && license_error_code(&first.1) == Some(130402) {
+            return tataplay_stream_limit_response();
         }
         if !first.0.is_success() && license_error_code(&first.1) == Some(130601) {
             // Irdeto consumes the playback token with the first challenge.
@@ -595,10 +653,13 @@ async fn drm_license_impl(
             {
                 tracing::debug!(
                     channel = %channel_id,
-                    url = %fresh.url,
                     "retrying tataplay license with a fresh token"
                 );
-                return license_response(send(&fresh.url, &fresh.headers, body).await);
+                let retried = send(&fresh.url, &fresh.headers, body).await;
+                if !retried.0.is_success() && license_error_code(&retried.1) == Some(130402) {
+                    return tataplay_stream_limit_response();
+                }
+                return license_response(retried);
             }
         }
         return license_response(first);
@@ -756,6 +817,18 @@ fn license_error_code(body: &[u8]) -> Option<i64> {
     }
 }
 
+#[cfg(feature = "beta")]
+fn tataplay_stream_limit_response() -> Response {
+    (
+        StatusCode::CONFLICT,
+        axum::Json(serde_json::json!({
+            "code": 130402,
+            "message": "Waiting for the previous stream to close"
+        })),
+    )
+        .into_response()
+}
+
 async fn send_license_parts(
     req: reqwest::RequestBuilder,
     body: Bytes,
@@ -784,7 +857,14 @@ async fn send_license_parts(
             (status, bytes, ct)
         }
         Err(error) => {
-            tracing::debug!(%error, "license upstream request failed");
+            let kind = if error.is_timeout() {
+                "timeout"
+            } else if error.is_connect() {
+                "connect"
+            } else {
+                "request"
+            };
+            tracing::debug!(error = kind, "license upstream request failed");
             (
                 StatusCode::BAD_GATEWAY,
                 Bytes::from_static(b"license upstream request failed"),
@@ -827,6 +907,8 @@ pub struct RenderMpdQuery {
     channel_id: Option<String>,
     q: Option<String>,
     hdnea: Option<String>,
+    #[cfg_attr(not(feature = "beta"), allow(dead_code))]
+    pid: Option<String>,
 }
 
 /// Tata Play's DASH manifest advertises Widevine without any `cenc:pssh`, so
@@ -845,6 +927,7 @@ async fn tataplay_mpd_pssh(
     channel_id: &str,
     mpd_url: &str,
     body: &str,
+    epoch: u64,
 ) -> Option<String> {
     if body.contains("<cenc:pssh") {
         return None;
@@ -852,30 +935,37 @@ async fn tataplay_mpd_pssh(
     if let Some(cached) = state.dash_state.get_tataplay_pssh(channel_id) {
         return Some(cached);
     }
-    let urls = tataplay_init_urls(mpd_url, body);
-    if urls.is_empty() {
+    let init_urls = tataplay_init_urls(mpd_url, body);
+    if init_urls.is_empty() {
         return None;
     }
     // The samples themselves can name a different key than the init segment's
     // `tenc`/PSSH (`seig` sample groups). That key is the one the CDM actually
     // needs, so probe one small media segment for its key id too.
-    let mut urls = urls;
-    urls.extend(tataplay_media_probe_urls(mpd_url, body));
+    let media_urls = tataplay_media_probe_urls(mpd_url, body);
+    let init_expected = init_urls.len();
+    let media_expected = media_urls.len();
+    let mut urls = init_urls;
+    urls.extend(media_urls.iter().cloned());
+    let cookie = crate::stream::extract_hdnea_from_url(mpd_url).map(|token| hdnea_cookie(&token));
     let mut fetches = tokio::task::JoinSet::new();
     for url in urls {
         let http = state.http.clone();
+        let cookie = cookie.clone();
+        let task_url = url.clone();
         fetches.spawn(async move {
-            let response = http
-                .get(&url)
-                .timeout(Duration::from_secs(8))
-                .send()
-                .await
-                .ok()?;
-            response.bytes().await.ok()
+            let mut request = http.get(&url).timeout(Duration::from_secs(8));
+            if let Some(cookie) = &cookie {
+                request = request.header(header::COOKIE, cookie);
+            }
+            let response = request.send().await.ok()?;
+            response.bytes().await.ok().map(|bytes| (task_url, bytes))
         });
     }
     let mut kids: Vec<[u8; 16]> = Vec::new();
     let mut seig_found = false;
+    let mut init_ok = 0usize;
+    let mut media_ok = 0usize;
     let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
     loop {
         let left = deadline.saturating_duration_since(tokio::time::Instant::now());
@@ -884,11 +974,14 @@ async fn tataplay_mpd_pssh(
             break;
         }
         match tokio::time::timeout(left, fetches.join_next()).await {
-            Ok(Some(Ok(Some(bytes)))) => {
-                pssh_key_ids(&bytes, &mut kids);
-                let before = kids.len();
-                seig_key_ids(&bytes, &mut kids);
-                seig_found |= kids.len() > before;
+            Ok(Some(Ok(Some((url, bytes))))) => {
+                if media_urls.contains(&url) {
+                    media_ok += 1;
+                    seig_found |= seig_key_ids(&bytes, &mut kids);
+                } else {
+                    init_ok += 1;
+                    pssh_key_ids(&bytes, &mut kids);
+                }
             }
             Ok(Some(_)) => {}
             Ok(None) => break,
@@ -898,13 +991,20 @@ async fn tataplay_mpd_pssh(
             }
         }
     }
-    if kids.is_empty() || !seig_found {
+    if init_ok < init_expected || media_ok < media_expected || kids.is_empty() || !seig_found {
         // Without the sample group's key the merged PSSH would ask for keys
         // that do not decrypt the media; fall back to the in-band PSSH instead.
         return None;
     }
     let pssh = merged_widevine_pssh(&kids);
-    state.dash_state.set_tataplay_pssh(channel_id, pssh.clone());
+    if !state
+        .dash_state
+        .set_tataplay_pssh(channel_id, pssh.clone(), epoch, || {
+            state.secure.current_epoch()
+        })
+    {
+        return None;
+    }
     Some(pssh)
 }
 
@@ -1046,6 +1146,26 @@ fn pssh_key_ids(data: &[u8], kids: &mut Vec<[u8; 16]>) {
             at = start + size;
             continue;
         }
+        // Version 1 stores a KID count and KIDs before the system data; a
+        // version 0 box stores a protobuf WidevinePsshData from byte 32.
+        if box_bytes[8] == 1 {
+            if let Some(count_bytes) = box_bytes.get(28..32) {
+                let count = u32::from_be_bytes(count_bytes.try_into().unwrap()) as usize;
+                for index in 0..count {
+                    let kid_start = 32 + index * 16;
+                    let Some(value) = box_bytes.get(kid_start..kid_start + 16) else {
+                        break;
+                    };
+                    let mut kid = [0u8; 16];
+                    kid.copy_from_slice(value);
+                    if !kids.contains(&kid) {
+                        kids.push(kid);
+                    }
+                }
+            }
+            at = start + size;
+            continue;
+        }
         let payload = &box_bytes[32..];
         let mut i = 0;
         while i < payload.len() {
@@ -1112,15 +1232,21 @@ fn tataplay_media_probe_urls(mpd_url: &str, body: &str) -> Vec<String> {
         }
         let start = attr_value(template, "startNumber")
             .and_then(|value| value.parse::<u64>().ok())
-            .unwrap_or(0);
+            .unwrap_or(1);
         // Probe the newest segment in the timeline: the first one may still be
         // encrypted with a rotation key from hours ago.
+        let mut unbounded = false;
         let count = xml_tag_text(block, "SegmentTimeline")
             .map(|timeline| {
                 xml_tags(timeline, "S")
                     .into_iter()
                     .map(|entry| {
-                        attr_value(entry, "r")
+                        let repeat = attr_value(entry, "r");
+                        if repeat == Some("-1") {
+                            unbounded = true;
+                            return 1;
+                        }
+                        repeat
                             .and_then(|value| value.parse::<u64>().ok())
                             .map(|repeat| repeat + 1)
                             .unwrap_or(1)
@@ -1129,6 +1255,11 @@ fn tataplay_media_probe_urls(mpd_url: &str, body: &str) -> Vec<String> {
             })
             .filter(|count| *count > 0)
             .unwrap_or(1);
+        if unbounded {
+            // The timeline is open-ended; the newest segment cannot be
+            // identified without the Period boundary.
+            return Vec::new();
+        }
         let number = start.saturating_add(count.saturating_sub(1));
         let Some(rep) = xml_tags(block, "Representation")
             .into_iter()
@@ -1178,7 +1309,8 @@ fn tataplay_media_probe_urls(mpd_url: &str, body: &str) -> Vec<String> {
 /// override the init segment's default key for the samples that reference
 /// them, and must be requested in the license challenge.
 #[cfg(feature = "beta")]
-fn seig_key_ids(data: &[u8], kids: &mut Vec<[u8; 16]>) {
+fn seig_key_ids(data: &[u8], kids: &mut Vec<[u8; 16]>) -> bool {
+    let mut found = false;
     let mut at = 0;
     while at + 24 <= data.len() {
         let Some(pos) = data[at..].windows(4).position(|w| w == b"sgpd") else {
@@ -1228,6 +1360,7 @@ fn seig_key_ids(data: &[u8], kids: &mut Vec<[u8; 16]>) {
             if let Some(kid_at) = kid_at {
                 let mut kid = [0u8; 16];
                 kid.copy_from_slice(&entry[kid_at..kid_at + 16]);
+                found = true;
                 if !kids.contains(&kid) {
                     kids.push(kid);
                 }
@@ -1235,6 +1368,7 @@ fn seig_key_ids(data: &[u8], kids: &mut Vec<[u8; 16]>) {
         }
         at = start + size;
     }
+    found
 }
 
 /// One Widevine PSSH v0 box whose `WidevinePsshData` lists every key id.
@@ -1311,6 +1445,26 @@ pub async fn render_mpd_handler(
     state.stable_since(epoch, response)
 }
 
+/// Apply a successful live refresh to the manifest URL, discarding it when
+/// the account changed during the fetch.
+fn apply_live_refresh(
+    state: &AppState,
+    channel_id: &str,
+    live: &LiveUrlOutput,
+    quality: &str,
+    epoch: u64,
+    decrypted: &mut String,
+) {
+    if state.secure.current_epoch() != epoch {
+        return;
+    }
+    state.observe_playback(channel_id, live);
+    let fresh = television::select_best_live_mpd_url(live, quality);
+    if !fresh.is_empty() {
+        *decrypted = fresh;
+    }
+}
+
 async fn render_mpd_inner(state: Arc<AppState>, q: RenderMpdQuery) -> Response {
     let Some(channel_id) = q.channel_id.as_deref().filter(|id| !id.is_empty()) else {
         return (StatusCode::BAD_REQUEST, "channel_id is required").into_response();
@@ -1321,18 +1475,35 @@ async fn render_mpd_inner(state: Arc<AppState>, q: RenderMpdQuery) -> Response {
         None => return (StatusCode::BAD_REQUEST, "invalid auth parameter").into_response(),
     };
     let quality = q.q.clone().unwrap_or_default();
-
     let epoch = state.secure.current_epoch();
-    if let Ok(live) = crate::stream::fetch_live(&state, channel_id).await {
-        // Successful resolution only: a failed refetch leaves what was learned
-        // untouched, and a switch during the fetch discards the observation.
-        if state.secure.current_epoch() == epoch {
-            state.observe_playback(channel_id, &live);
-            let fresh = television::select_best_live_mpd_url(&live, &quality);
-            if !fresh.is_empty() {
-                decrypted = fresh;
+
+    #[cfg(feature = "beta")]
+    {
+        let tata = crate::tataplay::is_tataplay_channel(channel_id);
+        if tata {
+            if let Some(pid) = q
+                .pid
+                .as_deref()
+                .and_then(|enc| decrypt_dash_route_value(&state.secure, channel_id, enc))
+            {
+                if !state.tataplay.playback_matches(channel_id, &pid) {
+                    return (StatusCode::CONFLICT, "stale playback").into_response();
+                }
             }
         }
+        if tata {
+            // Refresh only the tune that owns the slot. A late manifest for a
+            // channel the user left must not reopen it or close the new one.
+            if let Ok(live) = state.tataplay.refresh_live(channel_id).await {
+                apply_live_refresh(&state, channel_id, &live, &quality, epoch, &mut decrypted);
+            }
+        } else if let Ok(live) = crate::stream::fetch_live(&state, channel_id).await {
+            apply_live_refresh(&state, channel_id, &live, &quality, epoch, &mut decrypted);
+        }
+    }
+    #[cfg(not(feature = "beta"))]
+    if let Ok(live) = crate::stream::fetch_live(&state, channel_id).await {
+        apply_live_refresh(&state, channel_id, &live, &quality, epoch, &mut decrypted);
     }
 
     let Some((proxy_origin, proxy_host, base_path)) = cdn_host_and_dir(&decrypted) else {
@@ -1414,7 +1585,9 @@ async fn render_mpd_inner(state: Arc<AppState>, q: RenderMpdQuery) -> Response {
 
     #[cfg(feature = "beta")]
     if crate::tataplay::is_tataplay_channel(channel_id) {
-        if let Some(pssh) = tataplay_mpd_pssh(&state, channel_id, &decrypted, &body_str).await {
+        if let Some(pssh) =
+            tataplay_mpd_pssh(&state, channel_id, &decrypted, &body_str, epoch).await
+        {
             body_str = inject_widevine_pssh(&body_str, &pssh);
         }
     }
@@ -2026,6 +2199,7 @@ mod tests {
             .await;
 
         let tataplay = Arc::new(crate::tataplay_state::TataplayState::new(true));
+        tataplay.tune("tp_1918");
         tataplay.set_client_for_test(Arc::new(TpClient::for_test(
             &server.uri(),
             Credentials {
@@ -2127,6 +2301,7 @@ mod tests {
             .await;
 
         let tataplay = Arc::new(crate::tataplay_state::TataplayState::new(true));
+        tataplay.tune("tp_1918");
         tataplay.set_client_for_test(Arc::new(TpClient::for_test(
             &server.uri(),
             Credentials {
@@ -2136,6 +2311,7 @@ mod tests {
                 sid: "sid-1".into(),
             },
         )));
+        tataplay.mark_closed_for_test();
         let state = license_test_state_with(
             Arc::new(crate::playbox_state::PlayboxState::new(false)),
             tataplay,
@@ -2238,7 +2414,7 @@ mod tests {
         )
         .unwrap();
         let mut kids = Vec::new();
-        seig_key_ids(&box_bytes, &mut kids);
+        assert!(seig_key_ids(&box_bytes, &mut kids));
         assert_eq!(
             kids,
             vec![[
@@ -2246,6 +2422,30 @@ mod tests {
                 0x2b, 0x58,
             ]]
         );
+        // A duplicated KID still proves the media probe carried a seig entry.
+        assert!(seig_key_ids(&box_bytes, &mut kids));
+        assert_eq!(kids.len(), 1);
+    }
+
+    #[cfg(feature = "beta")]
+    #[test]
+    fn version_one_pssh_reads_the_header_kid_array() {
+        let kid = [
+            0x58u8, 0xd6, 0xc1, 0x34, 0xfe, 0x35, 0x59, 0x80, 0x89, 0xd6, 0x91, 0x96, 0x0a, 0x18,
+            0x84, 0xbb,
+        ];
+        let size = 32 + 16 + 4;
+        let mut box_bytes = Vec::with_capacity(size);
+        box_bytes.extend_from_slice(&(size as u32).to_be_bytes());
+        box_bytes.extend_from_slice(b"pssh");
+        box_bytes.extend_from_slice(&[1, 0, 0, 0]);
+        box_bytes.extend_from_slice(&WIDEVINE_SYSTEM_ID);
+        box_bytes.extend_from_slice(&1u32.to_be_bytes());
+        box_bytes.extend_from_slice(&kid);
+        box_bytes.extend_from_slice(&0u32.to_be_bytes());
+        let mut kids = Vec::new();
+        pssh_key_ids(&box_bytes, &mut kids);
+        assert_eq!(kids, vec![kid]);
     }
 
     #[cfg(feature = "beta")]
@@ -2274,6 +2474,126 @@ mod tests {
                 "https://cdn.example/live/channel/dash/video_1-104.m4s?hdnea=token",
             ]
         );
+    }
+
+    #[cfg(feature = "beta")]
+    #[test]
+    fn tataplay_playback_id_is_bound_into_the_route_urls() {
+        let state = license_test_state_with(
+            Arc::new(crate::playbox_state::PlayboxState::new(false)),
+            Arc::new(crate::tataplay_state::TataplayState::new(false)),
+        );
+        let mut live = LiveUrlOutput {
+            result: "OK".into(),
+            is_drm: true,
+            playback_id: "pid-1".into(),
+            ..Default::default()
+        };
+        live.mpd.auto = "https://cdn.example/live/ch.mpd".into();
+        live.key_url = "https://lic.example/license".into();
+
+        let out = build_drm_mpd_output(&state, &live, "tp_1", "auto").unwrap();
+        for url in [&out.play_url, &out.license_url] {
+            let pid = url
+                .split("pid=")
+                .nth(1)
+                .unwrap_or_else(|| panic!("missing pid in {url}"))
+                .split('&')
+                .next()
+                .unwrap();
+            assert_eq!(
+                decrypt_dash_route_value(&state.secure, "tp_1", pid).as_deref(),
+                Some("pid-1"),
+                "pid must decrypt for the channel in {url}"
+            );
+        }
+    }
+
+    /// A licence request from a previous tune of the same channel must not
+    /// reach the upstream or borrow the current session.
+    #[cfg(feature = "beta")]
+    #[tokio::test]
+    async fn tataplay_license_rejects_a_stale_playback_id() {
+        use crate::tataplay::{Client as TpClient, Credentials};
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/lit-ls-config/pub/api/v1/config"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "data": {"app": {"dd": {"v1": "ZG5INSxTMSVDbSN1cFclZQ==", "v2": "YWVzRW5jcnlwdGlvbktleQ=="}}}
+            })))
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/pas/api/v1/access/control/LIVE/1918"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "data": {
+                    "sessionId": "sess-a",
+                    "heartbeatInterval": 3600,
+                    "tokenInfo": {"token": "token-a"},
+                    "playbackUrls": {
+                        "dashWidewinePlayUrl": "not-encrypted",
+                        "dashWidewineLicenseUrl": "not-encrypted"
+                    }
+                }
+            })))
+            .mount(&server)
+            .await;
+        Mock::given(method("POST"))
+            .and(path("/smgs/api/v1/session"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({"code": 0})))
+            .mount(&server)
+            .await;
+        Mock::given(method("POST"))
+            .and(path("/license"))
+            .respond_with(ResponseTemplate::new(200).set_body_bytes(b"must-not-be-called".to_vec()))
+            .expect(0)
+            .mount(&server)
+            .await;
+
+        let tataplay = Arc::new(crate::tataplay_state::TataplayState::new(true));
+        tataplay.set_client_for_test(Arc::new(TpClient::for_test(
+            &server.uri(),
+            Credentials {
+                access_token: "access".into(),
+                refresh_token: "refresh".into(),
+                subscriber_id: "sub-1".into(),
+                sid: "sid-1".into(),
+            },
+        )));
+        let stale = tataplay.tune("tp_1918").unwrap();
+        tataplay.live("tp_1918").await.unwrap();
+        tataplay.tune("tp_1918");
+        tataplay.live("tp_1918").await.unwrap();
+
+        let state = license_test_state_with(
+            Arc::new(crate::playbox_state::PlayboxState::new(false)),
+            tataplay,
+        );
+        let params = std::collections::HashMap::from([
+            (
+                "auth".to_string(),
+                encrypt_dash_route_value(&state.secure, "tp_1918", "http://license.test/x"),
+            ),
+            ("channel_id".to_string(), "tp_1918".to_string()),
+            (
+                "pid".to_string(),
+                encrypt_dash_route_value(&state.secure, "tp_1918", &stale),
+            ),
+        ]);
+        let response = drm_license_handler(
+            State(state),
+            Query(params),
+            Method::POST,
+            axum::http::HeaderMap::new(),
+            Bytes::from_static(b"widevine-challenge"),
+        )
+        .await;
+
+        assert_eq!(response.status(), StatusCode::CONFLICT);
+        server.verify().await;
     }
 
     fn drm_output() -> DrmMpdOutput {
@@ -2476,6 +2796,7 @@ mod tests {
                 channel_id: Some("pb_ch1".into()),
                 q: Some("auto".into()),
                 hdnea: None,
+                pid: None,
             },
         )
         .await;

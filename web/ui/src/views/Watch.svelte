@@ -45,7 +45,7 @@
   let activityTimer = null;
   let toastTimer = null;
 
-  const fullStageKinds = new Set(["offline", "playback", "secure", "protected", "subscription", "restricted", "extras-signin", "extras-status", "extras-unavailable", "fastway-signin", "fastway-status", "fastway-unavailable", "playbox-signin", "playbox-status", "playbox-unavailable", "vzy-status", "vzy-unavailable", "service"]);
+  const fullStageKinds = new Set(["offline", "playback", "secure", "protected", "subscription", "restricted", "stream_limit", "extras-signin", "extras-status", "extras-unavailable", "fastway-signin", "fastway-status", "fastway-unavailable", "playbox-signin", "playbox-status", "playbox-unavailable", "vzy-status", "vzy-unavailable", "service"]);
 
   // Suggestions under the player come from the same category, so a viewer can
   // keep browsing the kind of channel they are already watching.
@@ -118,6 +118,10 @@
       } else {
         setPlayerState("restricted", "Account access", "The provider refused playback", `The current account may not have access, or its session may need refreshing.${providerStatus}`);
       }
+      return;
+    }
+    if (kind === "stream_limit") {
+      setPlayerState("stream_limit", "Account limit", "Waiting for the previous stream to close", "This account allows one live stream. Stop playback on any other device, then try again.");
       return;
     }
     setPlayerState("playback", "Playback issue", "Playback unavailable", "The live stream could not be started. Check the connection or try again in a moment.");

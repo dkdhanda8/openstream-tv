@@ -394,6 +394,10 @@ pub struct LiveUrlOutput {
     /// stream URL carried a `hdnea=` query parameter (see `Television::live`).
     #[serde(skip)]
     pub hdnea: String,
+    /// Not part of the wire format: identifies the exact tune so a stale
+    /// manifest or licence request can be rejected.
+    #[serde(skip)]
+    pub playback_id: String,
 }
 
 impl LiveUrlOutput {

@@ -1632,6 +1632,12 @@ pub async fn live_play(
             .into_response();
     }
 
+    #[cfg(feature = "beta")]
+    if crate::tataplay::is_tataplay_channel(&id) {
+        state.tataplay.tune(&id);
+        state.dash_state.invalidate_channel(&id);
+    }
+
     // The response URLs are encrypted under the current context epoch, so the
     // data they carry must belong to that epoch from lookup until the last URL
     // is generated. If an account switch lands in between, resolve again.

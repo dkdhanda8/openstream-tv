@@ -74,6 +74,20 @@ impl LicenseSession {
     }
 }
 
+#[derive(Clone, Debug)]
+struct PlaybackIntent {
+    document: String,
+    playback_id: String,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum PlaybackMode {
+    /// A user selection; may close the previous channel's session.
+    Tune,
+    /// A manifest/licence/media refresh; may only touch the current tune.
+    Refresh,
+}
+
 pub struct TataplayState {
     config_enabled: bool,
     client: RwLock<Option<Arc<Client>>>,
@@ -82,11 +96,20 @@ pub struct TataplayState {
     catalogue_failed_at: RwLock<Option<Instant>>,
     keys: RwLock<Option<(AppKeys, Instant)>>,
     resolved: RwLock<HashMap<String, (ResolvedPlayback, Instant)>>,
+    /// The channel the user last asked to play, and the id of that tune.
+    /// Refreshes may only reuse or re-resolve this channel; a late manifest
+    /// for a channel that has been left must not take the slot back.
+    intent: Mutex<Option<PlaybackIntent>>,
+    /// Serializes deliberate tunes and session handoffs for the single account.
+    tune: tokio::sync::Mutex<()>,
     /// Guide days keyed by IST midnight. Shared by XMLTV generation and the
     /// per-channel web guide so one day is fetched once.
     epg_cache: RwLock<HashMap<i64, (Vec<GuideChannel>, Instant)>>,
     /// Last media/license access, so the heartbeat can stop when playback ends.
     last_activity: Arc<Mutex<Instant>>,
+    /// When a session close was attempted, so a 130402 retry can be limited to
+    /// a local channel transition instead of another device's stream.
+    last_close: Mutex<Option<Instant>>,
     heartbeat: Mutex<Option<Heartbeat>>,
     /// Bumped under `commit` whenever account-scoped caches are cleared. A
     /// fetch captures it first and commits only if it is unchanged.
@@ -106,8 +129,11 @@ impl TataplayState {
             catalogue_failed_at: RwLock::new(None),
             keys: RwLock::new(None),
             resolved: RwLock::new(HashMap::new()),
+            intent: Mutex::new(None),
+            tune: tokio::sync::Mutex::new(()),
             epg_cache: RwLock::new(HashMap::new()),
             last_activity: Arc::new(Mutex::new(Instant::now())),
+            last_close: Mutex::new(None),
             heartbeat: Mutex::new(None),
             generation: AtomicU64::new(0),
             commit: Mutex::new(()),
@@ -339,10 +365,9 @@ impl TataplayState {
         let channels = client.guide_day(day_start).await?;
         let now = Instant::now();
         self.commit_if_current(generation, || {
-            self.epg_cache
-                .write()
-                .unwrap()
-                .insert(day_start, (channels.clone(), now));
+            let mut cache = self.epg_cache.write().unwrap();
+            cache.retain(|_, (_, at)| at.elapsed() < EPG_TTL);
+            cache.insert(day_start, (channels.clone(), now));
         });
         Ok(channels)
     }
@@ -462,11 +487,144 @@ impl TataplayState {
         slot.as_ref().map(|running| running.document.clone())
     }
 
-    async fn ensure_playback(&self, document: &str) -> Option<ResolvedPlayback> {
+    pub fn is_active_channel(&self, channel_id: &str) -> bool {
+        let Some(document) = document_id(channel_id) else {
+            return false;
+        };
+        self.active_document().as_deref() == Some(document)
+    }
+
+    /// Whether a session close was attempted recently, so a `130402` licence
+    /// refusal belongs to a local switch rather than another device.
+    pub fn recently_closed(&self, within: Duration) -> bool {
+        self.last_close
+            .lock()
+            .unwrap()
+            .is_some_and(|at| at.elapsed() <= within)
+    }
+
+    #[cfg(test)]
+    pub fn mark_closed_for_test(&self) {
+        *self.last_close.lock().unwrap() = Some(Instant::now());
+    }
+
+    /// Start a deliberate tune. The new id makes every manifest and licence
+    /// URL minted for the previous tune stale, including a return to the same
+    /// channel later.
+    pub fn tune(&self, channel_id: &str) -> Option<String> {
+        let document = document_id(channel_id)?;
+        let playback_id = Self::new_playback_id();
+        *self.intent.lock().unwrap() = Some(PlaybackIntent {
+            document: document.to_string(),
+            playback_id: playback_id.clone(),
+        });
+        Some(playback_id)
+    }
+
+    fn new_playback_id() -> String {
+        format!("{:016x}", rand::random::<u64>())
+    }
+
+    /// Start a tune only when the channel is not already the live intent.
+    /// Players that re-request `/live/mpd` during a manifest refresh must not
+    /// rotate their own route id.
+    pub fn tune_if_changed(&self, channel_id: &str) -> Option<String> {
+        let document = document_id(channel_id)?;
+        if self.intent_for(document).is_some()
+            && self.active_document().as_deref() == Some(document)
+        {
+            return self.current_playback_id(channel_id);
+        }
+        self.tune(channel_id)
+    }
+
+    fn intent_for(&self, document: &str) -> Option<PlaybackIntent> {
+        self.intent
+            .lock()
+            .unwrap()
+            .as_ref()
+            .filter(|intent| intent.document == document)
+            .cloned()
+    }
+
+    /// The intent for a tune, creating one when the caller did not go through
+    /// [`Self::tune`] (tests and direct provider use).
+    fn begin_tune(&self, document: &str) -> PlaybackIntent {
+        let mut intent = self.intent.lock().unwrap();
+        if let Some(current) = intent.as_ref() {
+            if current.document == document {
+                return current.clone();
+            }
+        }
+        let next = PlaybackIntent {
+            document: document.to_string(),
+            playback_id: Self::new_playback_id(),
+        };
+        *intent = Some(next.clone());
+        next
+    }
+
+    /// The playback id a route must present. Empty when no route is live.
+    pub fn current_playback_id(&self, channel_id: &str) -> Option<String> {
+        let document = document_id(channel_id)?;
+        if self.active_document().as_deref() == Some(document) {
+            if let Some((resolved, _)) = self.resolved.read().unwrap().get(document) {
+                if !resolved.playback_id.is_empty() {
+                    return Some(resolved.playback_id.clone());
+                }
+            }
+        }
+        self.intent_for(document).map(|intent| intent.playback_id)
+    }
+
+    /// Whether a route's playback id belongs to the tune that currently owns
+    /// the slot. An id from a previous tune of the same channel is stale.
+    pub fn playback_matches(&self, channel_id: &str, playback_id: &str) -> bool {
+        if playback_id.is_empty() {
+            return true;
+        }
+        let Some(document) = document_id(channel_id) else {
+            return false;
+        };
+        if self.active_document().as_deref() != Some(document) {
+            return false;
+        }
+        self.resolved
+            .read()
+            .unwrap()
+            .get(document)
+            .map(|(resolved, _)| resolved.playback_id == playback_id)
+            .unwrap_or(false)
+    }
+
+    async fn ensure_playback(
+        &self,
+        document: &str,
+        mode: PlaybackMode,
+    ) -> Option<ResolvedPlayback> {
         *self.last_activity.lock().unwrap() = Instant::now();
-        if let Some((resolved, at)) = self.resolved.read().unwrap().get(document) {
-            if at.elapsed() < PLAYBACK_TTL && self.session_is_active(document, resolved) {
-                return Some(resolved.clone());
+        if mode == PlaybackMode::Refresh {
+            self.intent_for(document)?;
+            if let Some(active) = self.active_document() {
+                if active != document {
+                    return None;
+                }
+            }
+        }
+        let cached = self.resolved.read().unwrap().get(document).cloned();
+        if let Some((resolved, at)) = cached {
+            if at.elapsed() < PLAYBACK_TTL && self.session_is_active(document, &resolved) {
+                let mut resolved = resolved;
+                if mode == PlaybackMode::Tune {
+                    let intent = self.begin_tune(document);
+                    if resolved.playback_id != intent.playback_id {
+                        resolved.playback_id = intent.playback_id.clone();
+                        if let Some((entry, _)) = self.resolved.write().unwrap().get_mut(document) {
+                            entry.playback_id = intent.playback_id;
+                        }
+                    }
+                }
+                return Some(resolved);
             }
         }
         let generation = self.generation();
@@ -474,40 +632,76 @@ impl TataplayState {
             tracing::warn!("tataplay: playback resolve has no client");
             return None;
         };
-        let _guard = self.locks.lock(&format!("playback:{document}")).await;
+        let _tune = self.tune.lock().await;
         if self.generation() != generation {
             tracing::warn!("tataplay: playback resolve lost its account generation");
             return None;
         }
-        if let Some((resolved, at)) = self.resolved.read().unwrap().get(document) {
-            if at.elapsed() < PLAYBACK_TTL && self.session_is_active(document, resolved) {
-                return Some(resolved.clone());
+        // Another resolve may have filled the cache while this one waited.
+        let cached = self.resolved.read().unwrap().get(document).cloned();
+        if let Some((resolved, at)) = cached {
+            if at.elapsed() < PLAYBACK_TTL && self.session_is_active(document, &resolved) {
+                let mut resolved = resolved;
+                if mode == PlaybackMode::Tune {
+                    let intent = self.begin_tune(document);
+                    if resolved.playback_id != intent.playback_id {
+                        resolved.playback_id = intent.playback_id.clone();
+                        if let Some((entry, _)) = self.resolved.write().unwrap().get_mut(document) {
+                            entry.playback_id = intent.playback_id;
+                        }
+                    }
+                }
+                return Some(resolved);
+            }
+        }
+        let intent = match mode {
+            PlaybackMode::Tune => self.begin_tune(document),
+            PlaybackMode::Refresh => match self.intent_for(document) {
+                Some(intent) => intent,
+                // A tune for another channel landed while this refresh waited.
+                None => return None,
+            },
+        };
+        if mode == PlaybackMode::Refresh {
+            if let Some(active) = self.active_document() {
+                if active != document {
+                    return None;
+                }
             }
         }
         let Some(keys) = self.app_keys().await else {
             tracing::warn!("tataplay: playback resolve has no decryption keys");
             return None;
         };
-        // The account's concurrency slot is one. Release the previous
-        // channel's session before asking access control for the next one,
-        // otherwise the upstream sees the old session and answers 403.
-        self.end_previous_session(document).await;
-        let resolved = match client.play(document, &keys).await {
+        // The account's concurrency slot is one. Release whatever session owns
+        // it before asking access control for the next one.
+        self.stop_heartbeat_and_wait().await;
+        let mut resolved = match client.play(document, &keys).await {
             Ok(resolved) => resolved,
             Err(error) => {
                 tracing::warn!(%error, "tataplay: playback resolve failed");
                 return None;
             }
         };
-        let now = Instant::now();
+        resolved.playback_id = intent.playback_id.clone();
+        // A newer tune may have landed during the access-control call. Do not
+        // install or beat a session for a channel the user has already left.
+        if self.intent_for(document).map(|current| current.playback_id)
+            != Some(intent.playback_id.clone())
+        {
+            if let Err(error) = client.end_session(&resolved.session_id).await {
+                tracing::debug!(%error, "tataplay stale resolve session end failed");
+            }
+            return None;
+        }
         let clone = resolved.clone();
         self.commit_if_current(generation, || {
             self.resolved
                 .write()
                 .unwrap()
-                .insert(document.to_string(), (resolved, now));
+                .insert(document.to_string(), (resolved, Instant::now()));
+            self.start_heartbeat(&client, document, &clone);
         })?;
-        self.start_heartbeat(&client, document, &clone);
         Some(clone)
     }
 
@@ -576,28 +770,14 @@ impl TataplayState {
         let Some(running) = running else {
             return;
         };
+        let document = running.document.clone();
+        *self.last_close.lock().unwrap() = Some(Instant::now());
         running.task.abort();
-        if let Err(error) = running.client.end_session(&running.session_id).await {
-            tracing::debug!(%error, "tataplay session end failed");
-        }
-    }
-
-    /// Closes the session owned by a different channel and waits for the
-    /// upstream DELETE, so the next access-control call sees a free slot.
-    async fn end_previous_session(&self, document: &str) {
-        let running = {
-            let mut slot = self.heartbeat.lock().unwrap();
-            match slot.as_ref() {
-                Some(running) if running.document != document => slot.take(),
-                _ => None,
+        match running.client.end_session(&running.session_id).await {
+            Ok(()) => tracing::debug!(document = %document, "tataplay session closed"),
+            Err(error) => {
+                tracing::debug!(%error, document = %document, "tataplay session end failed")
             }
-        };
-        let Some(running) = running else {
-            return;
-        };
-        running.task.abort();
-        if let Err(error) = running.client.end_session(&running.session_id).await {
-            tracing::debug!(%error, "tataplay replaced session end failed");
         }
     }
 
@@ -647,9 +827,27 @@ impl TataplayState {
             .ok_or_else(|| anyhow::anyhow!("tataplay: not a tataplay channel"))?;
         self.ensure_catalogue().await;
         let resolved = self
-            .ensure_playback(document)
+            .ensure_playback(document, PlaybackMode::Tune)
             .await
             .ok_or_else(|| anyhow::anyhow!("tataplay: playback could not be resolved"))?;
+        Ok(self.live_output(&resolved))
+    }
+
+    /// Refresh the manifest for the tune that already owns the slot. A
+    /// different channel's late manifest gets no resolve and cannot take the
+    /// slot back.
+    pub async fn refresh_live(&self, channel_id: &str) -> anyhow::Result<LiveUrlOutput> {
+        let document = document_id(channel_id)
+            .ok_or_else(|| anyhow::anyhow!("tataplay: not a tataplay channel"))?;
+        self.ensure_catalogue().await;
+        let resolved = self
+            .ensure_playback(document, PlaybackMode::Refresh)
+            .await
+            .ok_or_else(|| anyhow::anyhow!("tataplay: playback could not be refreshed"))?;
+        Ok(self.live_output(&resolved))
+    }
+
+    fn live_output(&self, resolved: &ResolvedPlayback) -> LiveUrlOutput {
         let mut out = LiveUrlOutput {
             result: "OK".to_string(),
             ..Default::default()
@@ -661,7 +859,8 @@ impl TataplayState {
         };
         out.key_url = resolved.license_url.clone();
         out.is_drm = !resolved.license_url.is_empty();
-        Ok(out)
+        out.playback_id = resolved.playback_id.clone();
+        out
     }
 
     /// Headers the media proxy must add for a resolved Tata Play channel.
@@ -669,7 +868,7 @@ impl TataplayState {
         let Some(document) = document_id(channel_id) else {
             return Vec::new();
         };
-        match self.ensure_playback(document).await {
+        match self.ensure_playback(document, PlaybackMode::Refresh).await {
             Some(resolved) => resolved.media_headers,
             None => Vec::new(),
         }
@@ -704,11 +903,25 @@ impl TataplayState {
 
         // A late retry for a channel that no longer owns the account's single
         // slot must not close the session the account is using now.
+        let _tune = self.tune.lock().await;
+        if self.intent_for(document).is_none() {
+            anyhow::bail!("tataplay: channel {channel_id} is no longer the intended playback");
+        }
         if let Some(active) = self.active_document() {
             if active != document {
                 anyhow::bail!("tataplay: channel {channel_id} is not the active playback");
             }
         }
+        let playback_id = self
+            .resolved
+            .read()
+            .unwrap()
+            .get(document)
+            .map(|(resolved, _)| resolved.playback_id.clone())
+            .filter(|id| !id.is_empty())
+            .or_else(|| self.intent_for(document).map(|intent| intent.playback_id))
+            .unwrap_or_default();
+        let generation = self.generation();
 
         let client = self
             .client()
@@ -745,15 +958,24 @@ impl TataplayState {
                 }
             }
         }
-        let resolved = resolved.ok_or_else(|| {
+        let mut resolved = resolved.ok_or_else(|| {
             last_error
                 .unwrap_or_else(|| anyhow::anyhow!("tataplay: playback could not be resolved"))
         })?;
-        self.resolved
-            .write()
-            .unwrap()
-            .insert(document.to_string(), (resolved.clone(), Instant::now()));
-        self.start_heartbeat(&client, document, &resolved);
+        resolved.playback_id = playback_id;
+        let committed = self.commit_if_current(generation, || {
+            self.resolved
+                .write()
+                .unwrap()
+                .insert(document.to_string(), (resolved.clone(), Instant::now()));
+            self.start_heartbeat(&client, document, &resolved);
+        });
+        if committed.is_none() {
+            if let Err(error) = client.end_session(&resolved.session_id).await {
+                tracing::debug!(%error, "tataplay stale refresh session end failed");
+            }
+            anyhow::bail!("tataplay: account changed during the license refresh");
+        }
         LicenseSession::from_playback(&resolved)
             .ok_or_else(|| anyhow::anyhow!("tataplay: playback carries no license URL"))
     }
@@ -772,7 +994,7 @@ impl TataplayState {
             }
         }
         let resolved = self
-            .ensure_playback(document)
+            .ensure_playback(document, PlaybackMode::Refresh)
             .await
             .ok_or_else(|| anyhow::anyhow!("tataplay: playback could not be resolved"))?;
         LicenseSession::from_playback(&resolved)
@@ -1000,6 +1222,315 @@ mod tests {
         server.verify().await;
     }
 
+    /// A deliberate tune must close the old session before asking access
+    /// control for the new channel.
+    #[tokio::test]
+    async fn tune_closes_the_old_session_before_resolving_the_next_channel() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/lit-ls-config/pub/api/v1/config"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "data": {"app": {"dd": {"v1": "ZG5INSxTMSVDbSN1cFclZQ==", "v2": "YWVzRW5jcnlwdGlvbktleQ=="}}}
+            })))
+            .mount(&server)
+            .await;
+        for (document, session, token) in
+            [("1918", "sess-a", "token-a"), ("523", "sess-b", "token-b")]
+        {
+            Mock::given(method("GET"))
+                .and(path(format!("/pas/api/v1/access/control/LIVE/{document}")))
+                .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                    "data": {
+                        "sessionId": session,
+                        "heartbeatInterval": 3600,
+                        "tokenInfo": {"token": token},
+                        "playbackUrls": {
+                            "dashWidewinePlayUrl": "not-encrypted",
+                            "dashWidewineLicenseUrl": format!("{}/{session}", server.uri())
+                        }
+                    }
+                })))
+                .mount(&server)
+                .await;
+        }
+        Mock::given(method("POST"))
+            .and(path("/smgs/api/v1/session"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({"code": 0})))
+            .mount(&server)
+            .await;
+        Mock::given(method("DELETE"))
+            .and(path("/smgs/api/v1/session"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({"code": 0})))
+            .mount(&server)
+            .await;
+
+        let state = TataplayState::new(true);
+        state.set_client_for_test(client_for(&server));
+        state.live("tp_1918").await.unwrap();
+        wait_for(&server, "POST", "/smgs/api/v1/session").await;
+
+        state.tune("tp_523");
+        state.live("tp_523").await.unwrap();
+
+        let requests = server.received_requests().await.unwrap();
+        let deleted_a = requests
+            .iter()
+            .position(|request| {
+                request.method.as_str() == "DELETE"
+                    && request
+                        .headers
+                        .get("x-session-id")
+                        .is_some_and(|value| value == "sess-a")
+            })
+            .expect("old session DELETE");
+        let get_b = requests
+            .iter()
+            .position(|request| {
+                request.method.as_str() == "GET" && request.url.path().ends_with("/LIVE/523")
+            })
+            .expect("access control for the new channel");
+        assert!(
+            deleted_a < get_b,
+            "DELETE A must precede access control for B"
+        );
+        assert_eq!(state.active_document().as_deref(), Some("523"));
+    }
+
+    /// A late refresh for the channel the user left must not reopen it or
+    /// close the channel that now owns the slot.
+    #[tokio::test]
+    async fn stale_refresh_does_not_take_the_slot_back() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/lit-ls-config/pub/api/v1/config"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "data": {"app": {"dd": {"v1": "ZG5INSxTMSVDbSN1cFclZQ==", "v2": "YWVzRW5jcnlwdGlvbktleQ=="}}}
+            })))
+            .mount(&server)
+            .await;
+        for (document, session) in [("1918", "sess-a"), ("523", "sess-b")] {
+            Mock::given(method("GET"))
+                .and(path(format!("/pas/api/v1/access/control/LIVE/{document}")))
+                .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                    "data": {
+                        "sessionId": session,
+                        "heartbeatInterval": 3600,
+                        "playbackUrls": {
+                            "dashWidewinePlayUrl": "not-encrypted",
+                            "dashWidewineLicenseUrl": "not-encrypted"
+                        }
+                    }
+                })))
+                .mount(&server)
+                .await;
+        }
+        Mock::given(method("POST"))
+            .and(path("/smgs/api/v1/session"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({"code": 0})))
+            .mount(&server)
+            .await;
+        Mock::given(method("DELETE"))
+            .and(path("/smgs/api/v1/session"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({"code": 0})))
+            .mount(&server)
+            .await;
+
+        let state = TataplayState::new(true);
+        state.set_client_for_test(client_for(&server));
+        state.live("tp_1918").await.unwrap();
+        state.tune("tp_523");
+        state.live("tp_523").await.unwrap();
+        let mark = server.received_requests().await.unwrap().len();
+
+        assert!(state.refresh_live("tp_1918").await.is_err());
+        assert_eq!(state.active_document().as_deref(), Some("523"));
+
+        let requests = server.received_requests().await.unwrap();
+        assert!(
+            !requests[mark..].iter().any(|request| {
+                request.method.as_str() == "GET" && request.url.path().ends_with("/LIVE/1918")
+            }),
+            "a stale refresh must not resolve the old channel"
+        );
+        assert!(
+            !requests[mark..].iter().any(|request| {
+                request.method.as_str() == "DELETE"
+                    && request
+                        .headers
+                        .get("x-session-id")
+                        .is_some_and(|value| value == "sess-b")
+            }),
+            "a stale refresh must not close the active channel"
+        );
+    }
+
+    #[tokio::test]
+    async fn returning_to_a_channel_rotates_its_playback_id() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/lit-ls-config/pub/api/v1/config"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "data": {"app": {"dd": {"v1": "ZG5INSxTMSVDbSN1cFclZQ==", "v2": "YWVzRW5jcnlwdGlvbktleQ=="}}}
+            })))
+            .mount(&server)
+            .await;
+        for (document, session) in [("1918", "sess-a"), ("523", "sess-b")] {
+            Mock::given(method("GET"))
+                .and(path(format!("/pas/api/v1/access/control/LIVE/{document}")))
+                .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                    "data": {
+                        "sessionId": session,
+                        "heartbeatInterval": 3600,
+                        "playbackUrls": {
+                            "dashWidewinePlayUrl": "not-encrypted",
+                            "dashWidewineLicenseUrl": "not-encrypted"
+                        }
+                    }
+                })))
+                .mount(&server)
+                .await;
+        }
+        Mock::given(method("POST"))
+            .and(path("/smgs/api/v1/session"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({"code": 0})))
+            .mount(&server)
+            .await;
+        Mock::given(method("DELETE"))
+            .and(path("/smgs/api/v1/session"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({"code": 0})))
+            .mount(&server)
+            .await;
+
+        let state = TataplayState::new(true);
+        state.set_client_for_test(client_for(&server));
+        let first = state.tune("tp_1918").unwrap();
+        state.live("tp_1918").await.unwrap();
+        assert!(state.playback_matches("tp_1918", &first));
+
+        state.tune("tp_523");
+        state.live("tp_523").await.unwrap();
+        let second = state.tune("tp_1918").unwrap();
+        state.live("tp_1918").await.unwrap();
+
+        assert_ne!(first, second);
+        assert!(!state.playback_matches("tp_1918", &first));
+        assert!(state.playback_matches("tp_1918", &second));
+    }
+
+    /// A licence refresh keeps the tune id so the player's existing manifest
+    /// and licence routes stay valid.
+    #[tokio::test]
+    async fn licence_refresh_preserves_the_tune_id() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/lit-ls-config/pub/api/v1/config"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "data": {"app": {"dd": {"v1": "ZG5INSxTMSVDbSN1cFclZQ==", "v2": "YWVzRW5jcnlwdGlvbktleQ=="}}}
+            })))
+            .mount(&server)
+            .await;
+        let plays = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let plays_for_response = plays.clone();
+        Mock::given(method("GET"))
+            .and(path("/pas/api/v1/access/control/LIVE/1918"))
+            .respond_with(move |_request: &wiremock::Request| {
+                let call = plays_for_response.fetch_add(1, Ordering::SeqCst);
+                let session = if call == 0 { "sess-a" } else { "sess-b" };
+                ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                    "data": {
+                        "sessionId": session,
+                        "heartbeatInterval": 3600,
+                        "tokenInfo": {"token": format!("token-{session}")},
+                        "playbackUrls": {
+                            "dashWidewinePlayUrl": "not-encrypted",
+                            "dashWidewineLicenseUrl": "not-encrypted"
+                        }
+                    }
+                }))
+            })
+            .mount(&server)
+            .await;
+        Mock::given(method("POST"))
+            .and(path("/smgs/api/v1/session"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({"code": 0})))
+            .mount(&server)
+            .await;
+        Mock::given(method("DELETE"))
+            .and(path("/smgs/api/v1/session"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({"code": 0})))
+            .mount(&server)
+            .await;
+
+        let state = TataplayState::new(true);
+        state.set_client_for_test(client_for(&server));
+        let tune = state.tune("tp_1918").unwrap();
+        state.live("tp_1918").await.unwrap();
+        let before = state.current_playback_id("tp_1918").unwrap();
+        assert_eq!(before, tune);
+
+        let first_session = state.license_session("tp_1918").await.unwrap();
+        state
+            .refresh_license("tp_1918", &first_session.session_id)
+            .await
+            .unwrap();
+
+        assert_eq!(
+            state.current_playback_id("tp_1918").as_deref(),
+            Some(tune.as_str()),
+            "a licence refresh must not rotate the route id"
+        );
+        assert_eq!(plays.load(Ordering::SeqCst), 2);
+    }
+
+    /// A 130402 on a deliberate tune gives the provider a moment, but a
+    /// failed DELETE must not stop the new channel from resolving.
+    #[tokio::test]
+    async fn failed_old_session_delete_does_not_block_the_new_channel() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/lit-ls-config/pub/api/v1/config"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "data": {"app": {"dd": {"v1": "ZG5INSxTMSVDbSN1cFclZQ==", "v2": "YWVzRW5jcnlwdGlvbktleQ=="}}}
+            })))
+            .mount(&server)
+            .await;
+        for (document, session) in [("1918", "sess-a"), ("523", "sess-b")] {
+            Mock::given(method("GET"))
+                .and(path(format!("/pas/api/v1/access/control/LIVE/{document}")))
+                .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                    "data": {
+                        "sessionId": session,
+                        "heartbeatInterval": 3600,
+                        "playbackUrls": {
+                            "dashWidewinePlayUrl": "not-encrypted",
+                            "dashWidewineLicenseUrl": "not-encrypted"
+                        }
+                    }
+                })))
+                .mount(&server)
+                .await;
+        }
+        Mock::given(method("POST"))
+            .and(path("/smgs/api/v1/session"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({"code": 0})))
+            .mount(&server)
+            .await;
+        Mock::given(method("DELETE"))
+            .and(path("/smgs/api/v1/session"))
+            .respond_with(ResponseTemplate::new(500))
+            .mount(&server)
+            .await;
+
+        let state = TataplayState::new(true);
+        state.set_client_for_test(client_for(&server));
+        state.live("tp_1918").await.unwrap();
+        state.tune("tp_523");
+        state.live("tp_523").await.unwrap();
+
+        assert_eq!(state.active_document().as_deref(), Some("523"));
+        assert!(state.playback_matches("tp_523", &state.current_playback_id("tp_523").unwrap()));
+    }
+
     /// A license request for the channel that was playing before a switch
     /// must not take the slot or close the channel that owns it now.
     #[tokio::test]
@@ -1023,13 +1554,21 @@ mod tests {
         wait_for(&server, "POST", "/smgs/api/v1/session").await;
 
         let error = state.license_session("tp_2").await.unwrap_err().to_string();
-        assert!(error.contains("not the active playback"), "{error}");
+        assert!(
+            error.contains("not the active playback")
+                || error.contains("no longer the intended playback"),
+            "{error}"
+        );
         let error = state
             .refresh_license("tp_2", "sess-stale")
             .await
             .unwrap_err()
             .to_string();
-        assert!(error.contains("not the active playback"), "{error}");
+        assert!(
+            error.contains("not the active playback")
+                || error.contains("no longer the intended playback"),
+            "{error}"
+        );
 
         assert_eq!(state.active_document().as_deref(), Some("tp_1"));
         assert_eq!(

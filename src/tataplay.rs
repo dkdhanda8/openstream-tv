@@ -663,21 +663,34 @@ impl Client {
     /// that pairs every channel with its number, logo, flags and pack ids.
     pub async fn catalogue(&self) -> anyhow::Result<Vec<crate::television::Channel>> {
         let today = tataplay_day_start();
-        let page = self
-            .guide_page(today, today + 86_400_000, CATALOGUE_PAGE_SIZE, 0, false)
-            .await?;
+        let end = today.saturating_add(86_400_000);
+        let mut channels = Vec::new();
+        let mut offset = 0;
+        loop {
+            let page = self
+                .guide_page(today, end, CATALOGUE_PAGE_SIZE, offset, false)
+                .await?;
+            if page.channels.is_empty() {
+                break;
+            }
+            let received = page.channels.len() as u64;
+            channels.extend(page.channels);
+            offset = offset.saturating_add(received as u32);
+            if page.total == 0 || offset >= page.total as u32 {
+                break;
+            }
+        }
         let packs = match self.entitlement_packs().await {
-            Ok(Some(packs)) => packs,
-            Ok(None) => Vec::new(),
+            Ok(Some(packs)) => Some(packs),
+            Ok(None) => None,
             Err(error) => {
                 tracing::warn!(%error, "tataplay: cannot read entitlements; publishing the un-gated catalogue");
-                Vec::new()
+                None
             }
         };
-        let mut rows: Vec<&GuideChannel> = page
-            .channels
+        let mut rows: Vec<&GuideChannel> = channels
             .iter()
-            .filter(|channel| channel.entitled(&packs))
+            .filter(|channel| channel.entitled_opt(packs.as_deref()))
             .collect();
         rows.sort_by(|a, b| {
             let an = a.channel_number.parse::<u32>();
@@ -725,6 +738,7 @@ impl Client {
                 .get("heartbeatInterval")
                 .and_then(Value::as_u64)
                 .filter(|seconds| *seconds > 0),
+            playback_id: String::new(),
         })
     }
 
@@ -802,6 +816,10 @@ pub struct ResolvedPlayback {
     pub session_id: String,
     /// Seconds between heartbeats, as the upstream requested them.
     pub heartbeat_interval: Option<u64>,
+    /// Identifier for one deliberate tune. A licence refresh keeps it; a new
+    /// tune rotates it so an old manifest or licence request is stale even if
+    /// the user returns to the same channel later.
+    pub playback_id: String,
 }
 
 fn base64_decode(value: &str) -> Option<Vec<u8>> {
@@ -991,13 +1009,20 @@ impl GuideChannel {
     /// packs listed on it. An empty list means the cataloguer published no
     /// gate, so the channel stays visible rather than being invented as
     /// premium.
-    pub fn entitled(&self, packs: &[String]) -> bool {
-        self.entitlements.is_empty()
-            || packs.is_empty()
-            || self
-                .entitlements
-                .iter()
-                .any(|pack| packs.iter().any(|held| held == pack))
+    pub fn entitled_opt(&self, packs: Option<&[String]>) -> bool {
+        match packs {
+            // Entitlements are unavailable: keep the catalogue un-gated rather
+            // than inventing a premium gate.
+            None => true,
+            Some(packs) => {
+                self.entitlements.is_empty()
+                    || (!packs.is_empty()
+                        && self
+                            .entitlements
+                            .iter()
+                            .any(|pack| packs.iter().any(|held| held == pack)))
+            }
+        }
     }
 }
 
@@ -2002,5 +2027,20 @@ mod tests {
         assert!(!encoded.contains("cdn.invalid"));
         assert!(!encoded.contains("license.invalid"));
         assert!(!encoded.contains("session-value"));
+    }
+    #[test]
+    fn entitlements_keep_unknown_open_and_gate_confirmed_empty() {
+        let gated = GuideChannel {
+            entitlements: vec!["pack-a".into()],
+            ..Default::default()
+        };
+        let open = GuideChannel::default();
+        assert!(gated.entitled_opt(None), "unknown entitlements stay open");
+        assert!(
+            !gated.entitled_opt(Some(&[])),
+            "confirmed none gates premium"
+        );
+        assert!(gated.entitled_opt(Some(&["pack-a".into()])));
+        assert!(open.entitled_opt(Some(&[])));
     }
 }
