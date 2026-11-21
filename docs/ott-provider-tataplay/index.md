@@ -140,13 +140,6 @@ message and a retry.
 The M3U licence property uses Kodi's four-field form:
 `<license-url>||R{SSM}|R`, with any `?q=` inside the URL before the pipes.
 
-The catalogue, M3U and XMLTV are filtered by the channel detail page's
-`playableOnMobile` and `playableOnBrowsers` flags. On the verification account
-348 of 356 guide channels were playable; Star Sports, Star Utsav and Colors
-Rishtey were hidden even though the guide listed them as subscribed. The flags
-follow the account's packs, and the 30-minute catalogue refresh re-probes a
-channel whose detail could not be read.
-
 The concurrency session's `POST`/`DELETE` must carry an OkHttp user agent
 (`okhttp/4.12.0`). Without it Akamai answers `403 Access Denied`, the heartbeat
 never starts, and the CDN freezes the live manifest at its first `publishTime`.
@@ -161,8 +154,8 @@ never starts, and the CDN freezes the live manifest at its first `publishTime`.
   `All Languages` until a per-channel detail fetch is worth the extra calls.
 - FTA channels can be entitled while access control returns no playback URL
   (for example Star Utsav and Colors Rishtey in the verification account).
-  The playability filter hides them when the channel detail reports both
-  platform flags false; a channel whose detail cannot be read stays visible.
+  They remain in the catalogue and fail at play rather than being guessed
+  unplayable.
 
 ### Playback sessions
 
