@@ -144,8 +144,16 @@ pub struct Credentials {
 impl Credentials {
     pub fn load(store: &crate::store::Store) -> Option<Credentials> {
         let raw = store.get_opt(STORE_KEY_CREDENTIALS)?;
-        let credentials: Credentials = serde_json::from_str(&raw).ok()?;
-        (!credentials.access_token.is_empty()).then_some(credentials)
+        let mut credentials: Credentials = serde_json::from_str(&raw).ok()?;
+        if credentials.access_token.is_empty() {
+            return None;
+        }
+        // Older stores predate the `subscriber_id = sid` fallback. The refresh
+        // endpoint requires it, so recover it from the session identity.
+        if credentials.subscriber_id.is_empty() {
+            credentials.subscriber_id = credentials.sid.clone();
+        }
+        Some(credentials)
     }
 
     fn save(&self, store: &crate::store::Store) -> anyhow::Result<()> {
@@ -1838,6 +1846,26 @@ mod tests {
         refresh.await.unwrap().unwrap();
 
         assert!(Credentials::load(&store).is_none());
+    }
+
+    #[test]
+    fn credentials_load_fills_missing_subscriber_id_from_sid() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = crate::store::Store::open(dir.path().to_str().unwrap()).unwrap();
+        store
+            .set(
+                STORE_KEY_CREDENTIALS,
+                &serde_json::to_string(&Credentials {
+                    access_token: "access".into(),
+                    refresh_token: "refresh".into(),
+                    subscriber_id: String::new(),
+                    sid: "sid-1".into(),
+                })
+                .unwrap(),
+            )
+            .unwrap();
+        let loaded = Credentials::load(&store).unwrap();
+        assert_eq!(loaded.subscriber_id, "sid-1");
     }
 
     #[tokio::test]
